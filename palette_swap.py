@@ -1,0 +1,1511 @@
+#!/usr/bin/env python3
+"""Horse Cursor palette swap.
+
+Ferramenta para recolorir os PNGs do tema Horse-Cursor, gerar um preview
+interativo e criar/instalar variantes do tema lado a lado.
+
+Exemplos:
+    python3 palette_swap.py --extract
+    python3 palette_swap.py --preview --map palette_map.csv
+    python3 palette_swap.py --build --variant Red --map palettes/Red.csv
+    python3 palette_swap.py --build-all
+    python3 palette_swap.py --install --variant Red
+    python3 palette_swap.py --package --variant Red
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import csv
+import json
+import math
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    sys.exit("Pillow não encontrado. Instale com: python3 -m pip install Pillow")
+
+
+ROOT = Path(__file__).resolve().parent
+SRC_DIR = ROOT / "Horse-Cursors-Files"
+THEME_DIR = ROOT / "Horse-Cursor"
+PALETTES_DIR = ROOT / "palettes"
+BUILD_DIR = ROOT / "build"
+DIST_DIR = ROOT / "dist"
+PREVIEW_DIR = ROOT / "preview"
+DEFAULT_MAP = ROOT / "palette_map.csv"
+
+HEX_RE = re.compile(r"^#?([0-9A-Fa-f]{6})$")
+VARIANT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# O olho é um único pixel escuro cercado pelos tons claros da cara. Essas são
+# as cores claras originais usadas nesse contorno; a detecção sempre roda nos
+# PNGs originais, então continua estável mesmo depois de recolorir.
+EYE_LIGHT_COLORS: frozenset[tuple[int, int, int]] = frozenset(
+    {
+        (0xFF, 0xB8, 0x48),
+        (0xFF, 0xD4, 0x8E),
+        (0xFF, 0xAA, 0x00),
+        (0xDC, 0x92, 0x00),
+    }
+)
+
+TARGET_COLOR = "color"
+TARGET_EYE = "eye"
+TARGETS = {TARGET_COLOR, TARGET_EYE}
+
+# Cores que ficam fora do swap por padrão. Elas só entram se aparecerem
+# explicitamente no CSV de mapeamento.
+IGNORED_COLORS: dict[tuple[int, int, int], str] = {
+    (255, 0, 0): "#FF0000 — X do Horse-Unavail",
+    (255, 72, 72): "#FF4848 — X claro do Horse-Unavail",
+    (0, 0, 0): "#000000 — contorno opaco do Horse-Help",
+}
+
+# Papéis derivados da legenda `pallet`. Cores que não têm correspondência
+# exata na legenda ficam como "a definir".
+KNOWN_ROLES: dict[tuple[int, int, int], str] = {
+    (0xDC, 0x92, 0x00): "sombreamento",
+    (0x96, 0x62, 0x00): "partes escuras",
+    (0xB9, 0x7A, 0x00): "sombra",
+    (0x50, 0x32, 0x00): "casco",
+    (0xFF, 0xAA, 0x00): "quase geral",
+    (0x56, 0x56, 0x56): "pelo cinza",
+    (0x73, 0x4A, 0x00): "escuro (a definir)",
+    (0xFF, 0xB8, 0x48): "partes claras",
+    (0x3E, 0x3E, 0x3E): "cinza escuro (a definir)",
+    (0xFF, 0xD4, 0x8E): "brilho",
+    (0x62, 0x62, 0x62): "rabo/crina",
+}
+
+
+@dataclass(frozen=True)
+class MapRow:
+    orig: tuple[int, int, int]
+    new: tuple[int, int, int]
+    role: str = ""
+    target: str = TARGET_COLOR
+
+    @property
+    def is_eye(self) -> bool:
+        return self.target == TARGET_EYE
+
+
+def rgb_to_hex(rgb: tuple[int, int, int]) -> str:
+    return "#%02X%02X%02X" % rgb
+
+
+def parse_hex(value: str) -> tuple[int, int, int]:
+    match = HEX_RE.match(value.strip())
+    if not match:
+        raise ValueError(f"cor inválida: {value!r} (use #RRGGBB)")
+    digits = match.group(1).upper()
+    return (
+        int(digits[0:2], 16),
+        int(digits[2:4], 16),
+        int(digits[4:6], 16),
+    )
+
+
+def iter_pixels(im: Image.Image):
+    """Pillow 13 deprecates getdata; use get_flattened_data when available."""
+    getter = getattr(im, "get_flattened_data", None)
+    if getter is not None:
+        return getter()
+    return im.getdata()
+
+
+def find_eye_pixels(
+    im: Image.Image,
+    eye_rgb: tuple[int, int, int],
+) -> list[tuple[int, int]]:
+    """Coordenadas do olho: pixel de `eye_rgb` cercado só por tons claros."""
+    im = im.convert("RGBA")
+    px = im.load()
+    width, height = im.size
+    hits: list[tuple[int, int]] = []
+
+    for y in range(1, height - 1):
+        for x in range(1, width - 1):
+            r, g, b, a = px[x, y]
+            if not a or (r, g, b) != eye_rgb:
+                continue
+            neighbors = (px[x + 1, y], px[x - 1, y], px[x, y + 1], px[x, y - 1])
+            if all(n[3] and n[:3] in EYE_LIGHT_COLORS for n in neighbors):
+                hits.append((x, y))
+
+    return hits
+
+
+def luminance(rgb: tuple[int, int, int]) -> float:
+    r, g, b = rgb
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def detect_eye_color(
+    files: list[Path],
+) -> tuple[int, int, int] | None:
+    """Descobre a cor do olho nos PNGs originais.
+
+    O olho é o único pixel de sua cor que aparece cercado pelos tons claros
+    da cara em todos os frames. Quando mais de uma cor se encaixa (o brilho
+    ao lado do olho, por exemplo), a mais escura vence.
+    """
+    exact_frames: Counter = Counter()
+    multi_frames: Counter = Counter()
+
+    for path in files:
+        im = Image.open(path).convert("RGBA")
+        px = im.load()
+        width, height = im.size
+        per_color: Counter = Counter()
+
+        for y in range(1, height - 1):
+            for x in range(1, width - 1):
+                r, g, b, a = px[x, y]
+                if not a:
+                    continue
+                neighbors = (
+                    px[x + 1, y],
+                    px[x - 1, y],
+                    px[x, y + 1],
+                    px[x, y - 1],
+                )
+                if all(n[3] and n[:3] in EYE_LIGHT_COLORS for n in neighbors):
+                    per_color[(r, g, b)] += 1
+
+        for rgb, count in per_color.items():
+            if count == 1:
+                exact_frames[rgb] += 1
+            else:
+                multi_frames[rgb] += 1
+
+    candidates = [
+        rgb
+        for rgb, frames in exact_frames.items()
+        if frames == len(files) and not multi_frames.get(rgb)
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=luminance)
+
+
+def scan_images(src_dir: Path = SRC_DIR) -> tuple[list[Path], Counter]:
+    files = sorted(src_dir.glob("*.png"))
+    if not files:
+        raise SystemExit(f"[erro] Nenhum PNG encontrado em {src_dir}")
+
+    counts: Counter = Counter()
+    for path in files:
+        im = Image.open(path).convert("RGBA")
+        for r, g, b, a in iter_pixels(im):
+            if a:
+                counts[(r, g, b)] += 1
+    return files, counts
+
+
+def read_map(path: Path) -> list[MapRow]:
+    if not path.exists():
+        raise SystemExit(f"[erro] Mapa não encontrado: {path}")
+
+    rows: list[MapRow] = []
+    seen: set[tuple[tuple[int, int, int], str]] = set()
+
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh)
+        if not reader.fieldnames:
+            raise SystemExit(f"[erro] {path}: CSV sem cabeçalho")
+
+        field_map = {name.strip().lower(): name for name in reader.fieldnames}
+        if not {"orig", "new"}.issubset(field_map):
+            raise SystemExit(
+                f"[erro] {path}: o CSV precisa das colunas orig,new,role"
+            )
+
+        def cell(raw: dict, name: str) -> str:
+            key = field_map.get(name)
+            return (raw.get(key) or "").strip() if key else ""
+
+        for lineno, raw in enumerate(reader, start=2):
+            orig_s = cell(raw, "orig")
+            if not orig_s:
+                continue
+            try:
+                orig = parse_hex(orig_s)
+                new_s = cell(raw, "new")
+                new = parse_hex(new_s) if new_s else orig
+            except ValueError as exc:
+                raise SystemExit(f"[erro] {path}:{lineno}: {exc}")
+
+            target = (cell(raw, "target") or TARGET_COLOR).lower()
+            if target not in TARGETS:
+                raise SystemExit(
+                    f"[erro] {path}:{lineno}: target inválido: {target!r} "
+                    f"(use {TARGET_COLOR} ou {TARGET_EYE})"
+                )
+
+            key = (orig, target)
+            if key in seen:
+                raise SystemExit(
+                    f"[erro] {path}:{lineno}: linha duplicada "
+                    f"{rgb_to_hex(orig)} ({target})"
+                )
+            seen.add(key)
+            rows.append(MapRow(orig, new, cell(raw, "role"), target))
+
+    return rows
+
+
+def make_rows(counts: Counter) -> list[MapRow]:
+    rows: list[MapRow] = []
+    for rgb, _count in counts.most_common():
+        if rgb in IGNORED_COLORS:
+            continue
+        rows.append(MapRow(rgb, rgb, KNOWN_ROLES.get(rgb, "a definir")))
+    return rows
+
+
+def write_map(path: Path, rows: list[MapRow]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["orig", "new", "role", "target"])
+        for row in rows:
+            writer.writerow(
+                [
+                    rgb_to_hex(row.orig),
+                    rgb_to_hex(row.new),
+                    row.role,
+                    row.target,
+                ]
+            )
+
+
+def make_lut(
+    rows: list[MapRow],
+) -> dict[tuple[int, int, int], tuple[int, int, int]]:
+    """Mapeamento cor → cor, ignorando as linhas específicas do olho."""
+    return {
+        row.orig: row.new
+        for row in rows
+        if not row.is_eye and row.orig != row.new
+    }
+
+
+def eye_pairs(
+    rows: list[MapRow],
+) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
+    return [(row.orig, row.new) for row in rows if row.is_eye]
+
+
+def recolor(
+    im: Image.Image,
+    lut: dict[tuple[int, int, int], tuple[int, int, int]],
+    eyes: list[tuple[tuple[int, int, int], tuple[int, int, int]]] | None = None,
+) -> tuple[Image.Image, Counter, Counter]:
+    """Recolore a imagem; devolve (imagem, cores alteradas, pixels do olho)."""
+    im = im.convert("RGBA")
+    px = im.load()
+    width, height = im.size
+
+    # A detecção usa a imagem original, antes de qualquer troca de cor.
+    eye_pixels: dict[tuple[int, int], tuple[tuple[int, int, int], tuple[int, int, int]]] = {}
+    for eye_orig, eye_new in eyes or []:
+        if eye_orig == eye_new:
+            continue
+        for pos in find_eye_pixels(im, eye_orig):
+            if pos in eye_pixels:
+                print(
+                    f"[aviso] {pos} é olho de mais de uma linha do CSV; "
+                    "usando a última."
+                )
+            eye_pixels[pos] = (eye_orig, eye_new)
+
+    changed: Counter = Counter()
+    eye_changed: Counter = Counter()
+
+    for y in range(height):
+        for x in range(width):
+            r, g, b, a = px[x, y]
+            if not a:
+                continue
+            if (x, y) in eye_pixels:
+                continue
+            new = lut.get((r, g, b))
+            if new is not None:
+                px[x, y] = (new[0], new[1], new[2], a)
+                changed[(r, g, b)] += 1
+
+    for (x, y), (orig, new) in eye_pixels.items():
+        px[x, y] = (new[0], new[1], new[2], 255)
+        eye_changed[orig] += 1
+
+    return im, changed, eye_changed
+
+
+def validate_map(
+    rows: list[MapRow],
+    counts: Counter,
+    strict: bool = False,
+) -> tuple[list[tuple[tuple[int, int, int], int]], list[tuple[int, int, int]]]:
+    mapped = {row.orig for row in rows}
+    unmapped = [
+        (rgb, counts[rgb])
+        for rgb in counts
+        if rgb not in mapped and rgb not in IGNORED_COLORS
+    ]
+    unknown = [row.orig for row in rows if row.orig not in counts]
+
+    if unmapped:
+        print("[aviso] Cores opacas sem mapa (serão mantidas):")
+        for rgb, count in sorted(unmapped, key=lambda item: -item[1]):
+            print(f"         {rgb_to_hex(rgb)}  {count:,} px")
+        if strict:
+            raise SystemExit(
+                "[erro] --strict: mapeie todas as cores opacas ou remova --strict"
+            )
+
+    if unknown:
+        print("[aviso] Cores no mapa que não existem nos PNGs:")
+        for rgb in unknown:
+            print(f"         {rgb_to_hex(rgb)}")
+
+    return unmapped, unknown
+
+
+def parse_cursors(
+    src_dir: Path = SRC_DIR,
+) -> tuple[list[Path], dict[str, list[tuple[str, int]]]]:
+    cursor_files = sorted(src_dir.glob("*.cursor"))
+    if not cursor_files:
+        raise SystemExit(f"[erro] Nenhum .cursor encontrado em {src_dir}")
+
+    sequences: dict[str, list[tuple[str, int]]] = {}
+    for cursor_file in cursor_files:
+        frames: list[tuple[str, int]] = []
+        for lineno, raw_line in enumerate(
+            cursor_file.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 5:
+                raise SystemExit(
+                    f"[erro] {cursor_file}:{lineno}: linha inválida: {raw_line!r}"
+                )
+            filename = parts[-2]
+            try:
+                delay = int(parts[-1])
+            except ValueError:
+                raise SystemExit(
+                    f"[erro] {cursor_file}:{lineno}: delay inválido: {parts[-1]!r}"
+                )
+            if not (src_dir / filename).exists():
+                raise SystemExit(
+                    f"[erro] {cursor_file}:{lineno}: frame não encontrado: {filename}"
+                )
+            frames.append((filename, delay))
+
+        if not frames:
+            raise SystemExit(f"[erro] {cursor_file}: nenhum frame")
+        sequences[cursor_file.stem] = frames
+
+    return cursor_files, sequences
+
+
+def build_preview_rows(rows: list[MapRow], counts: Counter) -> list[MapRow]:
+    seen: set[tuple[tuple[int, int, int], str]] = set()
+    seen_orig: set[tuple[int, int, int]] = set()
+    preview: list[MapRow] = []
+
+    for row in rows:
+        key = (row.orig, row.target)
+        if key in seen:
+            continue
+        seen.add(key)
+        seen_orig.add(row.orig)
+        preview.append(row)
+
+    for rgb, _count in counts.most_common():
+        if rgb in seen_orig or rgb in IGNORED_COLORS:
+            continue
+        seen_orig.add(rgb)
+        preview.append(MapRow(rgb, rgb, KNOWN_ROLES.get(rgb, "a definir")))
+
+    preview.sort(
+        key=lambda row: (
+            -counts.get(row.orig, 0),
+            rgb_to_hex(row.orig),
+            row.is_eye,
+        )
+    )
+    return preview
+
+
+def load_font(size: int):
+    for candidate in (
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    ):
+        if Path(candidate).exists():
+            return ImageFont.truetype(candidate, size)
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def checkerboard(
+    size: int,
+    cell: int = 8,
+    c1: tuple[int, int, int] = (48, 48, 48),
+    c2: tuple[int, int, int] = (64, 64, 64),
+) -> Image.Image:
+    tile = Image.new("RGB", (size, size), c1)
+    draw = ImageDraw.Draw(tile)
+    for y in range(0, size, cell):
+        for x in range(0, size, cell):
+            if ((x // cell) + (y // cell)) % 2:
+                draw.rectangle(
+                    (x, y, x + cell - 1, y + cell - 1), fill=c2
+                )
+    return tile
+
+
+def generate_contact_sheet(
+    rows: list[MapRow],
+    sequences: dict[str, list[tuple[str, int]]],
+    out_path: Path,
+    scale: int = 3,
+    cols: int = 8,
+) -> None:
+    lut = make_lut(rows)
+    eyes = eye_pairs(rows)
+
+    frame_order: list[str] = []
+    seen: set[str] = set()
+    for frames in sequences.values():
+        for filename, _delay in frames:
+            if filename not in seen:
+                seen.add(filename)
+                frame_order.append(filename)
+
+    sprite = 32 * scale
+    gap = 14
+    margin = 20
+    label_h = 22
+    cell_w = sprite * 2 + 8
+    cell_h = sprite + label_h
+    n_rows = math.ceil(len(frame_order) / cols) if frame_order else 1
+    sheet_w = margin * 2 + cols * cell_w + (cols - 1) * gap
+
+    title_font = load_font(20)
+    label_font = load_font(10)
+    small_font = load_font(9)
+
+    pal_cell_w = 150
+    pal_cell_h = 52
+    pal_cols = max(1, (sheet_w - margin * 2) // pal_cell_w)
+    pal_rows = math.ceil(len(rows) / pal_cols) if rows else 1
+    pal_y = margin + 62
+    grid_y = pal_y + pal_rows * pal_cell_h + 16
+    sheet_h = grid_y + n_rows * cell_h + (n_rows - 1) * gap + margin
+
+    sheet = Image.new("RGB", (sheet_w, sheet_h), (24, 24, 24))
+    draw = ImageDraw.Draw(sheet)
+
+    draw.text(
+        (margin, margin),
+        "Horse Cursor — Palette Swap — contact sheet",
+        font=title_font,
+        fill=(240, 240, 240),
+    )
+    draw.text(
+        (margin, margin + 26),
+        "Original à esquerda · recolorido à direita · xadrez = transparência",
+        font=small_font,
+        fill=(160, 160, 160),
+    )
+    draw.text(
+        (margin, margin + 46),
+        "Paleta aplicada",
+        font=label_font,
+        fill=(200, 200, 200),
+    )
+
+    for index, row in enumerate(rows):
+        col = index % pal_cols
+        line = index // pal_cols
+        x = margin + col * pal_cell_w
+        y = pal_y + line * pal_cell_h
+        draw.rectangle((x, y, x + 18, y + 18), fill=row.orig, outline=(10, 10, 10))
+        draw.rectangle(
+            (x + 22, y, x + 40, y + 18), fill=row.new, outline=(10, 10, 10)
+        )
+        draw.text(
+            (x, y + 22),
+            f"{rgb_to_hex(row.orig)} → {rgb_to_hex(row.new)}",
+            font=small_font,
+            fill=(220, 220, 220),
+        )
+        label = row.role or "—"
+        if row.is_eye and "olho" not in label.lower():
+            label += " · olho"
+        draw.text(
+            (x, y + 34),
+            label[:24],
+            font=small_font,
+            fill=(150, 150, 150),
+        )
+
+    background = checkerboard(sprite, cell=max(4, scale * 2))
+    for index, filename in enumerate(frame_order):
+        col = index % cols
+        line = index // cols
+        x = margin + col * (cell_w + gap)
+        y = grid_y + line * (cell_h + gap)
+
+        original = Image.open(SRC_DIR / filename).convert("RGBA")
+        recolored, _changed, _eye_changed = recolor(original, lut, eyes)
+
+        for offset, img in enumerate((original, recolored)):
+            tile = background.copy()
+            scaled = img.resize((sprite, sprite), Image.Resampling.NEAREST)
+            tile.paste(scaled, (0, 0), scaled)
+            px = x + offset * (sprite + 8)
+            sheet.paste(tile, (px, y))
+            draw.rectangle(
+                (px, y, px + sprite - 1, y + sprite - 1),
+                outline=(70, 70, 70),
+            )
+
+        draw.text(
+            (x, y + sprite + 3),
+            filename,
+            font=label_font,
+            fill=(210, 210, 210),
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(out_path)
+
+
+def json_for_script(value) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace(
+        "</", "<\\/"
+    )
+
+
+def generate_html(
+    rows: list[MapRow],
+    counts: Counter,
+    sequences: dict[str, list[tuple[str, int]]],
+    out_path: Path,
+) -> None:
+    frame_names = sorted(
+        {filename for frames in sequences.values() for filename, _ in frames}
+    )
+    frames_data = {}
+    for filename in frame_names:
+        data = (SRC_DIR / filename).read_bytes()
+        frames_data[filename] = (
+            "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+        )
+
+    palette_data = [
+        {
+            "orig": rgb_to_hex(row.orig),
+            "new": rgb_to_hex(row.new),
+            "role": row.role,
+            "target": row.target,
+            "count": counts.get(row.orig, 0),
+            "found": row.orig in counts,
+        }
+        for row in rows
+    ]
+
+    eye_rows = [row for row in rows if row.is_eye]
+    eye_data: dict[str, dict[str, list[list[int]]]] = {}
+    eye_counts: Counter = Counter()
+    if eye_rows:
+        for filename in frame_names:
+            im = Image.open(SRC_DIR / filename).convert("RGBA")
+            frame_eyes: dict[str, list[list[int]]] = {}
+            for row in eye_rows:
+                coords = find_eye_pixels(im, row.orig)
+                if coords:
+                    key = rgb_to_hex(row.orig)
+                    frame_eyes[key] = [[x, y] for x, y in coords]
+                    eye_counts[key] += len(coords)
+            eye_data[filename] = frame_eyes
+
+        for entry in palette_data:
+            if entry["target"] == TARGET_EYE:
+                entry["count"] = eye_counts.get(entry["orig"], 0)
+                entry["found"] = entry["count"] > 0
+
+    cursor_data = {
+        name: [[filename, delay] for filename, delay in frames]
+        for name, frames in sequences.items()
+    }
+
+    ignored_data = [
+        label
+        for rgb, label in IGNORED_COLORS.items()
+        if rgb in counts and all(row.orig != rgb for row in rows)
+    ]
+
+    meta_data = {
+        "frame_count": len(frame_names),
+        "cursor_count": len(sequences),
+        "png_count": len(list(SRC_DIR.glob("*.png"))),
+        "opaque_pixels": sum(counts.values()),
+    }
+
+    html_text = HTML_TEMPLATE
+    html_text = html_text.replace("__PALETTE_JSON__", json_for_script(palette_data))
+    html_text = html_text.replace("__CURSORS_JSON__", json_for_script(cursor_data))
+    html_text = html_text.replace("__FRAMES_JSON__", json_for_script(frames_data))
+    html_text = html_text.replace("__IGNORED_JSON__", json_for_script(ignored_data))
+    html_text = html_text.replace("__EYES_JSON__", json_for_script(eye_data))
+    html_text = html_text.replace("__META_JSON__", json_for_script(meta_data))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html_text, encoding="utf-8")
+
+
+def validate_variant(variant: str) -> None:
+    if variant in {".", ".."} or not VARIANT_RE.fullmatch(variant):
+        raise SystemExit(
+            f"[erro] nome de variante inválido: {variant!r} "
+            "(use letras, números, ., _ ou -)"
+        )
+
+
+def update_index_theme(path: Path, variant: str) -> None:
+    if not path.exists():
+        raise SystemExit(f"[erro] index.theme não encontrado: {path}")
+
+    text = path.read_text(encoding="utf-8")
+    if re.search(r"(?m)^Name=", text):
+        text = re.sub(
+            r"(?m)^Name=.*$", f"Name=Horse-Cursor {variant}", text, count=1
+        )
+    else:
+        text = text.replace(
+            "[Icon Theme]", f"[Icon Theme]\nName=Horse-Cursor {variant}", 1
+        )
+
+    if re.search(r"(?m)^Comment=", text):
+        text = re.sub(
+            r"(?m)^Comment=(.*)$",
+            lambda match: f"Comment={match.group(1).rstrip()} (variante: {variant})",
+            text,
+            count=1,
+        )
+
+    path.write_text(text, encoding="utf-8")
+
+
+def build_variant(variant: str, map_path: Path, strict: bool = False) -> Path:
+    validate_variant(variant)
+    if shutil.which("xcursorgen") is None:
+        raise SystemExit(
+            "[erro] xcursorgen não encontrado. Instale o pacote xcursorgen."
+        )
+    if not THEME_DIR.exists():
+        raise SystemExit(f"[erro] Tema original não encontrado: {THEME_DIR}")
+
+    map_rows = read_map(map_path)
+    files, counts = scan_images()
+    validate_map(map_rows, counts, strict=strict)
+    lut = make_lut(map_rows)
+    eyes = eye_pairs(map_rows)
+
+    build_dir = BUILD_DIR / variant
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+    build_dir.mkdir(parents=True)
+
+    changed: Counter = Counter()
+    eye_changed: Counter = Counter()
+    for src in files:
+        im = Image.open(src).convert("RGBA")
+        im, frame_changed, frame_eye_changed = recolor(im, lut, eyes)
+        changed.update(frame_changed)
+        eye_changed.update(frame_eye_changed)
+        im.save(build_dir / src.name)
+
+    cursor_files, _sequences = parse_cursors()
+    for cursor_file in cursor_files:
+        shutil.copy2(cursor_file, build_dir / cursor_file.name)
+
+    out_dir = build_dir / "out"
+    out_dir.mkdir()
+    for cursor_file in cursor_files:
+        output = out_dir / f"Cursor-{cursor_file.stem}"
+        result = subprocess.run(
+            ["xcursorgen", cursor_file.name, str(output.relative_to(build_dir))],
+            cwd=build_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise SystemExit(
+                f"[erro] xcursorgen falhou para {cursor_file.name}:\n"
+                f"{result.stderr.strip()}"
+            )
+        if not output.exists() or output.stat().st_size == 0:
+            raise SystemExit(f"[erro] xcursorgen não gerou {output}")
+
+    dist_theme = DIST_DIR / f"Horse-Cursor-{variant}"
+    if dist_theme.exists():
+        shutil.rmtree(dist_theme)
+    DIST_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(THEME_DIR, dist_theme, symlinks=True)
+
+    for compiled in sorted(out_dir.iterdir()):
+        shutil.copy2(compiled, dist_theme / "cursors" / compiled.name)
+
+    update_index_theme(dist_theme / "index.theme", variant)
+
+    total_changed = sum(changed.values()) + sum(eye_changed.values())
+    print(f"[ok] Variante: {variant}")
+    print(f"     Mapa: {map_path}")
+    print(f"     PNGs recoloridos: {len(files)} em {build_dir}")
+    print(f"     Pixels alterados: {total_changed:,}")
+    for rgb, count in changed.most_common(6):
+        print(f"       {rgb_to_hex(rgb)} -> {rgb_to_hex(lut[rgb])}: {count:,} px")
+    for row in map_rows:
+        if row.is_eye:
+            count = eye_changed.get(row.orig, 0)
+            print(
+                f"       olho {rgb_to_hex(row.orig)} -> "
+                f"{rgb_to_hex(row.new)}: {count:,} px"
+            )
+    if total_changed == 0:
+        print(
+            "[aviso] Nenhuma cor mudou (mapa identidade). "
+            "O tema é igual ao original."
+        )
+    print(f"[ok] Tema: {dist_theme}")
+    return dist_theme
+
+
+def cmd_extract(args: argparse.Namespace) -> None:
+    files, counts = scan_images()
+    rows = make_rows(counts)
+    out = Path(args.out).expanduser()
+
+    if out.exists() and not args.force:
+        print(f"[ok] {out} já existe; use --force para sobrescrever.")
+        return
+
+    eye = detect_eye_color(files)
+    eye_total = 0
+    if eye is not None:
+        for path in files:
+            eye_total += len(
+                find_eye_pixels(Image.open(path).convert("RGBA"), eye)
+            )
+        rows.append(MapRow(eye, eye, "olho", TARGET_EYE))
+
+    write_map(out, rows)
+    PALETTES_DIR.mkdir(exist_ok=True)
+    print(f"[ok] {len(rows)} cores escritas em {out}")
+    for row in rows:
+        if row.is_eye:
+            print(
+                f"     {rgb_to_hex(row.orig)} -> {rgb_to_hex(row.new)}  "
+                f"{row.role}  ({eye_total:,} px)  [somente o olho]"
+            )
+            continue
+        print(
+            f"     {rgb_to_hex(row.orig)} -> {rgb_to_hex(row.new)}  "
+            f"{row.role}  ({counts[row.orig]:,} px)"
+        )
+
+    ignored = [label for rgb, label in IGNORED_COLORS.items() if rgb in counts]
+    if ignored:
+        print("[info] Fora do swap por padrão:")
+        for label in ignored:
+            print(f"       {label}")
+
+
+def cmd_preview(args: argparse.Namespace) -> None:
+    files, counts = scan_images()
+    map_path = Path(args.map).expanduser() if args.map else DEFAULT_MAP
+
+    if map_path.exists():
+        map_rows = read_map(map_path)
+    elif args.map:
+        raise SystemExit(f"[erro] Mapa não encontrado: {map_path}")
+    else:
+        map_rows = make_rows(counts)
+        eye = detect_eye_color(files)
+        if eye is not None:
+            map_rows.append(MapRow(eye, eye, "olho", TARGET_EYE))
+        write_map(map_path, map_rows)
+        print(f"[ok] {map_path} criado a partir das cores atuais.")
+
+    PALETTES_DIR.mkdir(exist_ok=True)
+    validate_map(map_rows, counts, strict=False)
+
+    _cursor_files, sequences = parse_cursors()
+    preview_rows = build_preview_rows(map_rows, counts)
+
+    html_path = PREVIEW_DIR / "index.html"
+    sheet_path = PREVIEW_DIR / "contact_sheet.png"
+
+    generate_html(preview_rows, counts, sequences, html_path)
+    generate_contact_sheet(preview_rows, sequences, sheet_path)
+
+    print(f"[ok] Preview: {html_path}")
+    print(f"[ok] Contact sheet: {sheet_path}")
+    print(f"     Abra com: xdg-open {html_path}")
+
+
+def cmd_build(args: argparse.Namespace) -> None:
+    if not args.variant:
+        raise SystemExit("[erro] --build exige --variant")
+    if not args.map:
+        raise SystemExit("[erro] --build exige --map")
+    build_variant(
+        args.variant, Path(args.map).expanduser(), strict=args.strict
+    )
+
+
+def cmd_build_all(args: argparse.Namespace) -> None:
+    if not PALETTES_DIR.exists():
+        raise SystemExit(f"[erro] Pasta não encontrada: {PALETTES_DIR}")
+
+    maps = sorted(PALETTES_DIR.glob("*.csv"))
+    if not maps:
+        raise SystemExit(f"[erro] Nenhum CSV em {PALETTES_DIR}")
+
+    for map_path in maps:
+        variant = re.sub(r"[^A-Za-z0-9._-]+", "-", map_path.stem).strip("-")
+        if not variant:
+            print(f"[aviso] Ignorando {map_path.name}: nome de variante vazio")
+            continue
+        print(f"\n=== Build {variant} ({map_path.name}) ===")
+        build_variant(variant, map_path, strict=args.strict)
+
+
+def cmd_install(args: argparse.Namespace) -> None:
+    if not args.variant:
+        raise SystemExit("[erro] --install exige --variant")
+    validate_variant(args.variant)
+
+    src = DIST_DIR / f"Horse-Cursor-{args.variant}"
+    if not src.exists():
+        raise SystemExit(
+            f"[erro] Tema não encontrado: {src}\n"
+            f"       Rode --build --variant {args.variant} primeiro."
+        )
+
+    dest = (
+        Path(args.dest).expanduser()
+        if args.dest
+        else Path.home() / ".local" / "share" / "icons"
+    )
+    dest = dest.resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+
+    target = dest / src.name
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(src, target, symlinks=True)
+
+    print(f"[ok] Instalado em: {target}")
+    print(
+        f'     Selecione "Horse-Cursor {args.variant}" '
+        "nas configurações de cursor."
+    )
+    print(
+        "     Se o tema não aparecer, reabra a configuração do desktop "
+        "ou faça logout/login."
+    )
+
+
+def cmd_package(args: argparse.Namespace) -> None:
+    if not args.variant:
+        raise SystemExit("[erro] --package exige --variant")
+    validate_variant(args.variant)
+
+    src = DIST_DIR / f"Horse-Cursor-{args.variant}"
+    if not src.exists():
+        raise SystemExit(
+            f"[erro] Tema não encontrado: {src}\n"
+            f"       Rode --build --variant {args.variant} primeiro."
+        )
+
+    out = DIST_DIR / f"Horse-Cursor-{args.variant}.tar.gz"
+    with tarfile.open(out, "w:gz") as tar:
+        tar.add(src, arcname=src.name)
+    print(f"[ok] Pacote: {out}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Palette swap dos cursores Horse-Cursor.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--extract",
+        action="store_true",
+        help="gera o CSV de paleta a partir dos PNGs",
+    )
+    group.add_argument(
+        "--preview",
+        action="store_true",
+        help="gera preview/index.html + contact_sheet.png",
+    )
+    group.add_argument(
+        "--build", action="store_true", help="cria uma variante do tema"
+    )
+    group.add_argument(
+        "--build-all",
+        action="store_true",
+        help="cria todas as variantes de palettes/*.csv",
+    )
+    group.add_argument(
+        "--install",
+        action="store_true",
+        help="instala uma variante em ~/.local/share/icons",
+    )
+    group.add_argument(
+        "--package",
+        action="store_true",
+        help="gera dist/Horse-Cursor-<Variante>.tar.gz",
+    )
+    parser.add_argument(
+        "--map", type=Path, help="CSV de mapeamento (orig,new,role,target)"
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=DEFAULT_MAP,
+        help=f"saída do --extract (padrão: {DEFAULT_MAP.name})",
+    )
+    parser.add_argument(
+        "--variant", help="nome da variante (ex.: Red)"
+    )
+    parser.add_argument(
+        "--dest",
+        help="destino do --install (padrão: ~/.local/share/icons)",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="aborta se alguma cor opaca ficar fora do mapa",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="sobrescreve o CSV no --extract",
+    )
+    args = parser.parse_args(argv)
+
+    if args.extract:
+        cmd_extract(args)
+    elif args.preview:
+        cmd_preview(args)
+    elif args.build:
+        cmd_build(args)
+    elif args.build_all:
+        cmd_build_all(args)
+    elif args.install:
+        cmd_install(args)
+    elif args.package:
+        cmd_package(args)
+    return 0
+
+
+HTML_TEMPLATE = r"""<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Horse Cursor — Palette Swap Preview</title>
+<style>
+:root {
+  --bg: #171717;
+  --panel: #222222;
+  --panel-2: #2c2c2c;
+  --text: #eeeeee;
+  --muted: #a8a8a8;
+  --accent: #f0a500;
+  --border: #3a3a3a;
+  --ok: #7fb069;
+  --warn: #ff6b6b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 24px;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+h1 { margin: 0 0 8px; font-size: 1.55rem; }
+h2 {
+  margin: 32px 0 12px;
+  font-size: 1.15rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+}
+p { line-height: 1.5; }
+code {
+  background: #333;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+}
+.note { color: var(--muted); font-size: 0.9rem; }
+.palette-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 8px;
+}
+.palette-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+.swatches { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: 1px solid #000;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.15);
+}
+.arrow { color: var(--muted); }
+input[type="color"] {
+  width: 38px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+.meta { display: flex; flex-direction: column; gap: 2px; font-size: 0.85rem; min-width: 0; }
+.meta code { font-size: 0.8rem; }
+.role { color: var(--muted); }
+.count { color: var(--ok); }
+.warn { color: var(--warn); }
+.eye-row {
+  border-color: #7a5c00;
+  background: #2b2410;
+  box-shadow: inset 0 0 0 1px rgba(240, 165, 0, 0.25);
+}
+.badge {
+  align-self: flex-start;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: var(--accent);
+  color: #111;
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-weight: 700;
+}
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.controls label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.controls input[type="text"] {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  width: 140px;
+  font: inherit;
+}
+button {
+  background: var(--accent);
+  color: #111;
+  border: 0;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button.secondary {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+button:hover { filter: brightness(1.08); }
+button:active { transform: translateY(1px); }
+#status { color: var(--muted); font-size: 0.9rem; }
+.cursors-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 12px;
+}
+.cursor-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+}
+.cursor-card h3 {
+  margin: 0 0 10px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.anim-pair { display: flex; gap: 16px; justify-content: center; }
+.anim { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.anim span {
+  font-size: 0.72rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.anim canvas {
+  width: 128px;
+  height: 128px;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background-color: #333;
+  background-image:
+    linear-gradient(45deg, #444 25%, transparent 25%),
+    linear-gradient(-45deg, #444 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #444 75%),
+    linear-gradient(-45deg, transparent 75%, #444 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+footer {
+  margin-top: 40px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+@media (max-width: 600px) {
+  body { padding: 12px; }
+  .anim canvas { width: 96px; height: 96px; }
+  .anim-pair { gap: 8px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Horse Cursor — Palette Swap</h1>
+  <p class="note">Ajuste as cores abaixo e veja os cursores mudarem na hora. Quando gostar, exporte o CSV e rode o build.</p>
+</header>
+
+<section>
+  <h2>Paleta</h2>
+  <div class="palette-grid" id="palette-grid"></div>
+  <p class="note" id="ignored-note"></p>
+  <div class="controls">
+    <label>Variante <input type="text" id="variant-name" value="MinhaCor" spellcheck="false" autocomplete="off"></label>
+    <button type="button" id="reset" class="secondary">Reset</button>
+    <button type="button" id="export">Exportar CSV</button>
+    <span id="status">carregando…</span>
+  </div>
+</section>
+
+<section id="eye-section" hidden>
+  <h2>Olho</h2>
+  <p class="note">Essa cor vale <strong>só para o pixel do olho</strong>. As outras partes que usam a mesma cor original continuam com o mapeamento normal da paleta acima.</p>
+  <div class="palette-grid" id="eye-grid"></div>
+</section>
+
+<section>
+  <h2>Cursores</h2>
+  <div class="cursors-grid" id="cursors-grid"></div>
+</section>
+
+<footer>
+  Gerado por <code>palette_swap.py</code> · <span id="meta"></span>
+</footer>
+
+<script>
+const PALETTE = __PALETTE_JSON__;
+const CURSORS = __CURSORS_JSON__;
+const FRAMES = __FRAMES_JSON__;
+const IGNORED = __IGNORED_JSON__;
+const EYES = __EYES_JSON__;
+const META = __META_JSON__;
+
+const images = {};
+const recolored = new Map();
+const stateKey = p => p.orig + '|' + p.target;
+const state = new Map(PALETTE.map(p => [stateKey(p), p.new]));
+const totalImages = Object.keys(FRAMES).length;
+
+function esc(value) {
+  return String(value).replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+function rgbToHex(r, g, b) {
+  return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+}
+
+function paletteRow(p) {
+  const isEye = p.target === 'eye';
+  const row = document.createElement('div');
+  row.className = 'palette-row' + (isEye ? ' eye-row' : '');
+  row.innerHTML = `
+    <div class="swatches">
+      <span class="swatch" style="background:${p.orig}" title="Original ${p.orig}"></span>
+      <span class="arrow">→</span>
+      <input type="color" value="${p.new}" data-key="${stateKey(p)}" aria-label="Nova cor para ${p.orig}">
+    </div>
+    <div class="meta">
+      ${isEye ? '<span class="badge">olho</span>' : ''}
+      <code>${esc(p.orig)}</code>
+      <span class="role">${esc(p.role || '—')}</span>
+      <span class="count">${p.count.toLocaleString('pt-BR')} px${isEye ? ' · 1 por frame' : ''}</span>
+      ${p.found ? '' : '<span class="warn">não encontrada nos PNGs</span>'}
+    </div>`;
+  return row;
+}
+
+function buildPaletteUI() {
+  const grid = document.getElementById('palette-grid');
+  const eyeGrid = document.getElementById('eye-grid');
+  const eyeSection = document.getElementById('eye-section');
+  let eyeRows = 0;
+  for (const p of PALETTE) {
+    if (p.target === 'eye') {
+      eyeGrid.appendChild(paletteRow(p));
+      eyeRows++;
+    } else {
+      grid.appendChild(paletteRow(p));
+    }
+  }
+  if (eyeRows) eyeSection.hidden = false;
+  document.body.addEventListener('input', event => {
+    const input = event.target.closest('input[type="color"]');
+    if (!input || !input.dataset.key) return;
+    state.set(input.dataset.key, input.value.toUpperCase());
+    scheduleRebuild();
+  });
+  if (IGNORED.length) {
+    document.getElementById('ignored-note').textContent =
+      'Fora do swap por padrão: ' + IGNORED.join(' · ') + '. Para incluí-las, adicione linhas no CSV.';
+  } else {
+    document.getElementById('ignored-note').textContent =
+      'Todas as cores opacas dos PNGs estão no mapa.';
+  }
+}
+
+function buildCursorCards() {
+  const grid = document.getElementById('cursors-grid');
+  for (const name of Object.keys(CURSORS)) {
+    const card = document.createElement('div');
+    card.className = 'cursor-card';
+    card.dataset.cursor = name;
+    card.innerHTML = `
+      <h3>${esc(name)}</h3>
+      <div class="anim-pair">
+        <div class="anim"><span>Original</span><canvas class="before" width="32" height="32"></canvas></div>
+        <div class="anim"><span>Novo</span><canvas class="after" width="32" height="32"></canvas></div>
+      </div>`;
+    grid.appendChild(card);
+  }
+}
+
+function loadImages() {
+  return Promise.all(Object.entries(FRAMES).map(([name, url]) => new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => { images[name] = img; resolve(); };
+    img.onerror = () => reject(new Error('falha ao carregar ' + name));
+    img.src = url;
+  })));
+}
+
+function buildRecolored() {
+  if (Object.keys(images).length < totalImages) return;
+
+  const lut = new Map();
+  const eyeLut = new Map();
+  for (const p of PALETTE) {
+    const neu = state.get(stateKey(p)) || p.new;
+    if (neu === p.orig) continue;
+    if (p.target === 'eye') eyeLut.set(p.orig, hexToRgb(neu));
+    else lut.set(p.orig, hexToRgb(neu));
+  }
+
+  recolored.clear();
+  let changedPixels = 0;
+  let changedFrames = 0;
+
+  for (const [name, img] of Object.entries(images)) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 32;
+    canvas.height = 32;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.clearRect(0, 0, 32, 32);
+    ctx.drawImage(img, 0, 0);
+
+    const eyeIndex = new Map();
+    for (const [orig, coords] of Object.entries(EYES[name] || {})) {
+      for (const [x, y] of coords) eyeIndex.set((y * 32 + x) * 4, orig);
+    }
+
+    if (lut.size || eyeLut.size) {
+      const data = ctx.getImageData(0, 0, 32, 32);
+      const px = data.data;
+      let frameChanged = 0;
+      for (let i = 0; i < px.length; i += 4) {
+        if (px[i + 3] === 0) continue;
+        if (eyeIndex.has(i)) continue;
+        const key = rgbToHex(px[i], px[i + 1], px[i + 2]);
+        const neu = lut.get(key);
+        if (neu) {
+          px[i] = neu[0];
+          px[i + 1] = neu[1];
+          px[i + 2] = neu[2];
+          frameChanged++;
+        }
+      }
+      for (const [i, orig] of eyeIndex) {
+        const neu = eyeLut.get(orig);
+        if (!neu) continue;
+        px[i] = neu[0];
+        px[i + 1] = neu[1];
+        px[i + 2] = neu[2];
+        frameChanged++;
+      }
+      if (frameChanged) {
+        ctx.putImageData(data, 0, 0);
+        changedPixels += frameChanged;
+        changedFrames++;
+      }
+    }
+
+    recolored.set(name, canvas);
+  }
+
+  document.getElementById('status').textContent =
+    `${changedPixels.toLocaleString('pt-BR')} pixels alterados em ${changedFrames} frames`;
+}
+
+let rebuildTimer = null;
+function scheduleRebuild() {
+  clearTimeout(rebuildTimer);
+  rebuildTimer = setTimeout(buildRecolored, 40);
+}
+
+function startAnimations() {
+  for (const card of document.querySelectorAll('.cursor-card')) {
+    const name = card.dataset.cursor;
+    const seq = CURSORS[name];
+    if (!seq || !seq.length) continue;
+
+    const before = card.querySelector('canvas.before');
+    const after = card.querySelector('canvas.after');
+    const bctx = before.getContext('2d');
+    const actx = after.getContext('2d');
+    let index = 0;
+
+    const step = () => {
+      const [file, delay] = seq[index % seq.length];
+      bctx.clearRect(0, 0, 32, 32);
+      bctx.drawImage(images[file], 0, 0);
+      actx.clearRect(0, 0, 32, 32);
+      const frame = recolored.get(file);
+      if (frame) actx.drawImage(frame, 0, 0);
+      index++;
+      setTimeout(step, delay);
+    };
+
+    step();
+  }
+}
+
+document.getElementById('reset').addEventListener('click', () => {
+  for (const p of PALETTE) {
+    state.set(stateKey(p), p.new);
+    const input = document.querySelector(`input[data-key="${stateKey(p)}"]`);
+    if (input) input.value = p.new;
+  }
+  buildRecolored();
+});
+
+document.getElementById('export').addEventListener('click', () => {
+  const rawName = document.getElementById('variant-name').value.trim() || 'variante';
+  const name = rawName.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'variante';
+  const lines = ['orig,new,role,target'];
+  for (const p of PALETTE) {
+    const neu = state.get(stateKey(p)) || p.orig;
+    const role = String(p.role || '').replace(/"/g, '""');
+    lines.push(`${p.orig},${neu},"${role}",${p.target || 'color'}`);
+  }
+  const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name + '.csv';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+
+async function init() {
+  buildPaletteUI();
+  buildCursorCards();
+  await loadImages();
+  buildRecolored();
+  startAnimations();
+  document.getElementById('meta').textContent =
+    `${META.frame_count} frames · ${META.cursor_count} cursores · ${META.opaque_pixels.toLocaleString('pt-BR')} pixels opacos`;
+}
+
+init().catch(error => {
+  console.error(error);
+  document.getElementById('status').textContent = 'Erro: ' + error.message;
+});
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
