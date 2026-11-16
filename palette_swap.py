@@ -1100,6 +1100,20 @@ code {
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.15);
 }
 .arrow { color: var(--muted); }
+.color-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.hex-label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  line-height: 1;
+  color: var(--text);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
 input[type="color"] {
   width: 38px;
   height: 30px;
@@ -1292,7 +1306,10 @@ function paletteRow(p) {
     <div class="swatches">
       <span class="swatch" style="background:${p.orig}" title="Original ${p.orig}"></span>
       <span class="arrow">→</span>
-      <input type="color" value="${p.new}" data-key="${stateKey(p)}" aria-label="Nova cor para ${p.orig}">
+      <div class="color-block">
+        <span class="hex-label" title="Cor selecionada">${p.new}</span>
+        <input type="color" value="${p.new}" data-key="${stateKey(p)}" aria-label="Nova cor para ${p.orig}">
+      </div>
     </div>
     <div class="meta">
       ${isEye ? '<span class="badge">olho</span>' : ''}
@@ -1321,7 +1338,10 @@ function buildPaletteUI() {
   document.body.addEventListener('input', event => {
     const input = event.target.closest('input[type="color"]');
     if (!input || !input.dataset.key) return;
-    state.set(input.dataset.key, input.value.toUpperCase());
+    const value = input.value.toUpperCase();
+    state.set(input.dataset.key, value);
+    const label = input.closest('.color-block')?.querySelector('.hex-label');
+    if (label) label.textContent = value;
     scheduleRebuild();
   });
   if (IGNORED.length) {
@@ -1462,7 +1482,10 @@ document.getElementById('reset').addEventListener('click', () => {
   for (const p of PALETTE) {
     state.set(stateKey(p), p.new);
     const input = document.querySelector(`input[data-key="${stateKey(p)}"]`);
-    if (input) input.value = p.new;
+    if (!input) continue;
+    input.value = p.new;
+    const label = input.closest('.color-block')?.querySelector('.hex-label');
+    if (label) label.textContent = p.new.toUpperCase();
   }
   buildRecolored();
 });
