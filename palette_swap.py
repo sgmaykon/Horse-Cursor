@@ -61,7 +61,18 @@ EYE_LIGHT_COLORS: frozenset[tuple[int, int, int]] = frozenset(
 
 TARGET_COLOR = "color"
 TARGET_EYE = "eye"
-TARGETS = {TARGET_COLOR, TARGET_EYE}
+TARGET_MANE = "mane"
+TARGETS = {TARGET_COLOR, TARGET_EYE, TARGET_MANE}
+
+# A crina fica na parte superior do sprite. Consideramos "região da crina" os
+# pixels da cor alvo acima desta fração da altura opaca do cavalo. A detecção
+# usa o bounding box de cada frame, então funciona mesmo quando o cavalo está
+# deslocado (Move, Vertical, etc.).
+MANE_TOP_RATIO = 0.35
+
+# Cores da arte original que também formam a crina. O `--extract` cria uma
+# linha `target=mane` para elas, permitindo recolorir cascos e crina separado.
+MANE_SOURCE_COLORS: tuple[tuple[int, int, int], ...] = ((0x50, 0x32, 0x00),)
 
 # Cores que ficam fora do swap por padrão. Elas só entram se aparecerem
 # explicitamente no CSV de mapeamento.
@@ -77,7 +88,7 @@ KNOWN_ROLES: dict[tuple[int, int, int], str] = {
     (0xDC, 0x92, 0x00): "sombreamento",
     (0x96, 0x62, 0x00): "partes escuras",
     (0xB9, 0x7A, 0x00): "sombra",
-    (0x50, 0x32, 0x00): "casco",
+    (0x50, 0x32, 0x00): "cascos/contorno",
     (0xFF, 0xAA, 0x00): "quase geral",
     (0x56, 0x56, 0x56): "pelo cinza",
     (0x73, 0x4A, 0x00): "escuro (a definir)",
@@ -98,6 +109,10 @@ class MapRow:
     @property
     def is_eye(self) -> bool:
         return self.target == TARGET_EYE
+
+    @property
+    def is_region(self) -> bool:
+        return self.target != TARGET_COLOR
 
 
 def rgb_to_hex(rgb: tuple[int, int, int]) -> str:
@@ -144,6 +159,58 @@ def find_eye_pixels(
                 hits.append((x, y))
 
     return hits
+
+
+def sprite_bbox(im: Image.Image) -> tuple[int, int, int, int] | None:
+    """Caixa dos pixels opacos (minx, miny, maxx, maxy)."""
+    im = im.convert("RGBA")
+    px = im.load()
+    width, height = im.size
+    xs = [x for x in range(width) if any(px[x, y][3] for y in range(height))]
+    ys = [y for y in range(height) if any(px[x, y][3] for x in range(width))]
+    if not xs or not ys:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def find_mane_pixels(
+    im: Image.Image,
+    mane_rgb: tuple[int, int, int],
+    ratio: float = MANE_TOP_RATIO,
+) -> list[tuple[int, int]]:
+    """Coordenadas da crina: pixels de `mane_rgb` na parte superior do sprite."""
+    im = im.convert("RGBA")
+    box = sprite_bbox(im)
+    if box is None:
+        return []
+
+    _minx, miny, _maxx, maxy = box
+    span = max(maxy - miny, 1)
+    px = im.load()
+    width, height = im.size
+    hits: list[tuple[int, int]] = []
+
+    for y in range(height):
+        if (y - miny) / span >= ratio:
+            continue
+        for x in range(width):
+            r, g, b, a = px[x, y]
+            if a and (r, g, b) == mane_rgb:
+                hits.append((x, y))
+
+    return hits
+
+
+def find_region_pixels(
+    im: Image.Image,
+    rgb: tuple[int, int, int],
+    target: str,
+) -> list[tuple[int, int]]:
+    if target == TARGET_EYE:
+        return find_eye_pixels(im, rgb)
+    if target == TARGET_MANE:
+        return find_mane_pixels(im, rgb)
+    return []
 
 
 def luminance(rgb: tuple[int, int, int]) -> float:
@@ -277,7 +344,7 @@ def make_rows(counts: Counter) -> list[MapRow]:
 def write_map(path: Path, rows: list[MapRow]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
+        writer = csv.writer(fh, lineterminator="\n")
         writer.writerow(["orig", "new", "role", "target"])
         for row in rows:
             writer.writerow(
@@ -293,63 +360,73 @@ def write_map(path: Path, rows: list[MapRow]) -> None:
 def make_lut(
     rows: list[MapRow],
 ) -> dict[tuple[int, int, int], tuple[int, int, int]]:
-    """Mapeamento cor → cor, ignorando as linhas específicas do olho."""
+    """Mapeamento cor → cor, ignorando as linhas de região (olho, crina)."""
     return {
         row.orig: row.new
         for row in rows
-        if not row.is_eye and row.orig != row.new
+        if not row.is_region and row.orig != row.new
     }
 
 
-def eye_pairs(
+def region_pairs(
     rows: list[MapRow],
-) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
-    return [(row.orig, row.new) for row in rows if row.is_eye]
+) -> list[tuple[str, tuple[int, int, int], tuple[int, int, int]]]:
+    return [
+        (row.target, row.orig, row.new) for row in rows if row.is_region
+    ]
 
 
 def recolor(
     im: Image.Image,
     lut: dict[tuple[int, int, int], tuple[int, int, int]],
-    eyes: list[tuple[tuple[int, int, int], tuple[int, int, int]]] | None = None,
+    regions: list[
+        tuple[str, tuple[int, int, int], tuple[int, int, int]]
+    ]
+    | None = None,
 ) -> tuple[Image.Image, Counter, Counter]:
-    """Recolore a imagem; devolve (imagem, cores alteradas, pixels do olho)."""
+    """Recolore a imagem; devolve (imagem, cores alteradas, pixels de região)."""
     im = im.convert("RGBA")
     px = im.load()
     width, height = im.size
 
-    # A detecção usa a imagem original, antes de qualquer troca de cor.
-    eye_pixels: dict[tuple[int, int], tuple[tuple[int, int, int], tuple[int, int, int]]] = {}
-    for eye_orig, eye_new in eyes or []:
-        if eye_orig == eye_new:
-            continue
-        for pos in find_eye_pixels(im, eye_orig):
-            if pos in eye_pixels:
+    # A detecção usa a imagem original, antes de qualquer troca de cor. As
+    # regiões reservam seus pixels sempre, mesmo com cor final igual à
+    # original: assim a linha normal do CSV não pinta a crina/olho junto.
+    region_pixels: dict[
+        tuple[int, int], tuple[str, tuple[int, int, int], tuple[int, int, int]]
+    ] = {}
+    for target, orig, new in regions or []:
+        for pos in find_region_pixels(im, orig, target):
+            if pos in region_pixels:
+                previous = region_pixels[pos][0]
                 print(
-                    f"[aviso] {pos} é olho de mais de uma linha do CSV; "
-                    "usando a última."
+                    f"[aviso] {pos} está em mais de uma região "
+                    f"({previous}, {target}); usando {target}."
                 )
-            eye_pixels[pos] = (eye_orig, eye_new)
+            region_pixels[pos] = (target, orig, new)
 
     changed: Counter = Counter()
-    eye_changed: Counter = Counter()
+    region_changed: Counter = Counter()
 
     for y in range(height):
         for x in range(width):
             r, g, b, a = px[x, y]
             if not a:
                 continue
-            if (x, y) in eye_pixels:
+            if (x, y) in region_pixels:
                 continue
             new = lut.get((r, g, b))
             if new is not None:
                 px[x, y] = (new[0], new[1], new[2], a)
                 changed[(r, g, b)] += 1
 
-    for (x, y), (orig, new) in eye_pixels.items():
+    for (x, y), (target, orig, new) in region_pixels.items():
+        if orig == new:
+            continue
         px[x, y] = (new[0], new[1], new[2], 255)
-        eye_changed[orig] += 1
+        region_changed[(target, orig)] += 1
 
-    return im, changed, eye_changed
+    return im, changed, region_changed
 
 
 def validate_map(
@@ -446,7 +523,7 @@ def build_preview_rows(rows: list[MapRow], counts: Counter) -> list[MapRow]:
         key=lambda row: (
             -counts.get(row.orig, 0),
             rgb_to_hex(row.orig),
-            row.is_eye,
+            row.is_region,
         )
     )
     return preview
@@ -491,7 +568,7 @@ def generate_contact_sheet(
     cols: int = 8,
 ) -> None:
     lut = make_lut(rows)
-    eyes = eye_pairs(rows)
+    regions = region_pairs(rows)
 
     frame_order: list[str] = []
     seen: set[str] = set()
@@ -560,8 +637,8 @@ def generate_contact_sheet(
             fill=(220, 220, 220),
         )
         label = row.role or "—"
-        if row.is_eye and "olho" not in label.lower():
-            label += " · olho"
+        if row.is_region and row.target not in label.lower():
+            label += f" · {row.target}"
         draw.text(
             (x, y + 34),
             label[:24],
@@ -577,7 +654,7 @@ def generate_contact_sheet(
         y = grid_y + line * (cell_h + gap)
 
         original = Image.open(SRC_DIR / filename).convert("RGBA")
-        recolored, _changed, _eye_changed = recolor(original, lut, eyes)
+        recolored, _changed, _region_changed = recolor(original, lut, regions)
 
         for offset, img in enumerate((original, recolored)):
             tile = background.copy()
@@ -635,25 +712,33 @@ def generate_html(
         for row in rows
     ]
 
-    eye_rows = [row for row in rows if row.is_eye]
-    eye_data: dict[str, dict[str, list[list[int]]]] = {}
-    eye_counts: Counter = Counter()
-    if eye_rows:
+    region_rows = [row for row in rows if row.is_region]
+    region_data: dict[
+        str, dict[str, dict[str, list[list[int]]]]
+    ] = {}
+    region_counts: Counter = Counter()
+    if region_rows:
         for filename in frame_names:
             im = Image.open(SRC_DIR / filename).convert("RGBA")
-            frame_eyes: dict[str, list[list[int]]] = {}
-            for row in eye_rows:
-                coords = find_eye_pixels(im, row.orig)
-                if coords:
-                    key = rgb_to_hex(row.orig)
-                    frame_eyes[key] = [[x, y] for x, y in coords]
-                    eye_counts[key] += len(coords)
-            eye_data[filename] = frame_eyes
+            frame_regions: dict[str, dict[str, list[list[int]]]] = {}
+            for row in region_rows:
+                coords = find_region_pixels(im, row.orig, row.target)
+                if not coords:
+                    continue
+                key = rgb_to_hex(row.orig)
+                frame_regions.setdefault(row.target, {})[key] = [
+                    [x, y] for x, y in coords
+                ]
+                region_counts[(row.target, key)] += len(coords)
+            region_data[filename] = frame_regions
 
         for entry in palette_data:
-            if entry["target"] == TARGET_EYE:
-                entry["count"] = eye_counts.get(entry["orig"], 0)
-                entry["found"] = entry["count"] > 0
+            if entry["target"] != TARGET_COLOR:
+                count = region_counts.get(
+                    (entry["target"], entry["orig"]), 0
+                )
+                entry["count"] = count
+                entry["found"] = count > 0
 
     cursor_data = {
         name: [[filename, delay] for filename, delay in frames]
@@ -678,7 +763,7 @@ def generate_html(
     html_text = html_text.replace("__CURSORS_JSON__", json_for_script(cursor_data))
     html_text = html_text.replace("__FRAMES_JSON__", json_for_script(frames_data))
     html_text = html_text.replace("__IGNORED_JSON__", json_for_script(ignored_data))
-    html_text = html_text.replace("__EYES_JSON__", json_for_script(eye_data))
+    html_text = html_text.replace("__REGIONS_JSON__", json_for_script(region_data))
     html_text = html_text.replace("__META_JSON__", json_for_script(meta_data))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -731,7 +816,7 @@ def build_variant(variant: str, map_path: Path, strict: bool = False) -> Path:
     files, counts = scan_images()
     validate_map(map_rows, counts, strict=strict)
     lut = make_lut(map_rows)
-    eyes = eye_pairs(map_rows)
+    regions = region_pairs(map_rows)
 
     build_dir = BUILD_DIR / variant
     if build_dir.exists():
@@ -739,12 +824,12 @@ def build_variant(variant: str, map_path: Path, strict: bool = False) -> Path:
     build_dir.mkdir(parents=True)
 
     changed: Counter = Counter()
-    eye_changed: Counter = Counter()
+    region_changed: Counter = Counter()
     for src in files:
         im = Image.open(src).convert("RGBA")
-        im, frame_changed, frame_eye_changed = recolor(im, lut, eyes)
+        im, frame_changed, frame_region_changed = recolor(im, lut, regions)
         changed.update(frame_changed)
-        eye_changed.update(frame_eye_changed)
+        region_changed.update(frame_region_changed)
         im.save(build_dir / src.name)
 
     cursor_files, _sequences = parse_cursors()
@@ -780,7 +865,7 @@ def build_variant(variant: str, map_path: Path, strict: bool = False) -> Path:
 
     update_index_theme(dist_theme / "index.theme", variant)
 
-    total_changed = sum(changed.values()) + sum(eye_changed.values())
+    total_changed = sum(changed.values()) + sum(region_changed.values())
     print(f"[ok] Variante: {variant}")
     print(f"     Mapa: {map_path}")
     print(f"     PNGs recoloridos: {len(files)} em {build_dir}")
@@ -788,10 +873,10 @@ def build_variant(variant: str, map_path: Path, strict: bool = False) -> Path:
     for rgb, count in changed.most_common(6):
         print(f"       {rgb_to_hex(rgb)} -> {rgb_to_hex(lut[rgb])}: {count:,} px")
     for row in map_rows:
-        if row.is_eye:
-            count = eye_changed.get(row.orig, 0)
+        if row.is_region:
+            count = region_changed.get((row.target, row.orig), 0)
             print(
-                f"       olho {rgb_to_hex(row.orig)} -> "
+                f"       {row.target} {rgb_to_hex(row.orig)} -> "
                 f"{rgb_to_hex(row.new)}: {count:,} px"
             )
     if total_changed == 0:
@@ -813,22 +898,30 @@ def cmd_extract(args: argparse.Namespace) -> None:
         return
 
     eye = detect_eye_color(files)
-    eye_total = 0
     if eye is not None:
-        for path in files:
-            eye_total += len(
-                find_eye_pixels(Image.open(path).convert("RGBA"), eye)
-            )
         rows.append(MapRow(eye, eye, "olho", TARGET_EYE))
+    for rgb in MANE_SOURCE_COLORS:
+        if rgb in counts:
+            rows.append(MapRow(rgb, rgb, "crina", TARGET_MANE))
+
+    region_totals: Counter = Counter()
+    region_rows = [row for row in rows if row.is_region]
+    for path in files:
+        im = Image.open(path).convert("RGBA")
+        for row in region_rows:
+            region_totals[(row.target, row.orig)] += len(
+                find_region_pixels(im, row.orig, row.target)
+            )
 
     write_map(out, rows)
     PALETTES_DIR.mkdir(exist_ok=True)
     print(f"[ok] {len(rows)} cores escritas em {out}")
     for row in rows:
-        if row.is_eye:
+        if row.is_region:
+            count = region_totals.get((row.target, row.orig), 0)
             print(
                 f"     {rgb_to_hex(row.orig)} -> {rgb_to_hex(row.new)}  "
-                f"{row.role}  ({eye_total:,} px)  [somente o olho]"
+                f"{row.role}  ({count:,} px)  [somente {row.target}]"
             )
             continue
         print(
@@ -856,6 +949,9 @@ def cmd_preview(args: argparse.Namespace) -> None:
         eye = detect_eye_color(files)
         if eye is not None:
             map_rows.append(MapRow(eye, eye, "olho", TARGET_EYE))
+        for rgb in MANE_SOURCE_COLORS:
+            if rgb in counts:
+                map_rows.append(MapRow(rgb, rgb, "crina", TARGET_MANE))
         write_map(map_path, map_rows)
         print(f"[ok] {map_path} criado a partir das cores atuais.")
 
@@ -1128,7 +1224,7 @@ input[type="color"] {
 .role { color: var(--muted); }
 .count { color: var(--ok); }
 .warn { color: var(--warn); }
-.eye-row {
+.region-row {
   border-color: #7a5c00;
   background: #2b2410;
   box-shadow: inset 0 0 0 1px rgba(240, 165, 0, 0.25);
@@ -1254,11 +1350,7 @@ footer {
   </div>
 </section>
 
-<section id="eye-section" hidden>
-  <h2>Olho</h2>
-  <p class="note">Essa cor vale <strong>só para o pixel do olho</strong>. As outras partes que usam a mesma cor original continuam com o mapeamento normal da paleta acima.</p>
-  <div class="palette-grid" id="eye-grid"></div>
-</section>
+<div id="regions"></div>
 
 <section>
   <h2>Cursores</h2>
@@ -1274,8 +1366,19 @@ const PALETTE = __PALETTE_JSON__;
 const CURSORS = __CURSORS_JSON__;
 const FRAMES = __FRAMES_JSON__;
 const IGNORED = __IGNORED_JSON__;
-const EYES = __EYES_JSON__;
+const REGIONS = __REGIONS_JSON__;
 const META = __META_JSON__;
+
+const REGION_META = {
+  eye: {
+    title: 'Olho',
+    note: 'Essa cor vale <strong>só para o pixel do olho</strong>. As outras partes que usam a mesma cor original continuam com o mapeamento normal da paleta acima.'
+  },
+  mane: {
+    title: 'Crina',
+    note: 'Essa cor vale <strong>só para os pixels da crina</strong> (parte superior do cavalo). Os cascos e contornos com a mesma cor original continuam com o mapeamento normal da paleta acima.'
+  }
+};
 
 const images = {};
 const recolored = new Map();
@@ -1299,9 +1402,11 @@ function rgbToHex(r, g, b) {
 }
 
 function paletteRow(p) {
-  const isEye = p.target === 'eye';
+  const isRegion = p.target !== 'color';
+  const badge = (REGION_META[p.target]?.title || p.target).toLowerCase();
+  const perFrame = p.target === 'eye' ? ' · 1 por frame' : '';
   const row = document.createElement('div');
-  row.className = 'palette-row' + (isEye ? ' eye-row' : '');
+  row.className = 'palette-row' + (isRegion ? ' region-row' : '');
   row.innerHTML = `
     <div class="swatches">
       <span class="swatch" style="background:${p.orig}" title="Original ${p.orig}"></span>
@@ -1312,10 +1417,10 @@ function paletteRow(p) {
       </div>
     </div>
     <div class="meta">
-      ${isEye ? '<span class="badge">olho</span>' : ''}
+      ${isRegion ? `<span class="badge">${esc(badge)}</span>` : ''}
       <code>${esc(p.orig)}</code>
       <span class="role">${esc(p.role || '—')}</span>
-      <span class="count">${p.count.toLocaleString('pt-BR')} px${isEye ? ' · 1 por frame' : ''}</span>
+      <span class="count">${p.count.toLocaleString('pt-BR')} px${perFrame}</span>
       ${p.found ? '' : '<span class="warn">não encontrada nos PNGs</span>'}
     </div>`;
   return row;
@@ -1323,18 +1428,29 @@ function paletteRow(p) {
 
 function buildPaletteUI() {
   const grid = document.getElementById('palette-grid');
-  const eyeGrid = document.getElementById('eye-grid');
-  const eyeSection = document.getElementById('eye-section');
-  let eyeRows = 0;
+  const regionsHost = document.getElementById('regions');
+  const groups = new Map();
   for (const p of PALETTE) {
-    if (p.target === 'eye') {
-      eyeGrid.appendChild(paletteRow(p));
-      eyeRows++;
-    } else {
+    if (p.target === 'color') {
       grid.appendChild(paletteRow(p));
+    } else {
+      if (!groups.has(p.target)) groups.set(p.target, []);
+      groups.get(p.target).push(p);
     }
   }
-  if (eyeRows) eyeSection.hidden = false;
+  for (const [target, rows] of groups) {
+    const meta = REGION_META[target] || {
+      title: target,
+      note: `Essa cor vale só para a região <strong>${esc(target)}</strong>.`
+    };
+    const section = document.createElement('section');
+    section.innerHTML = `<h2>${esc(meta.title)}</h2><p class="note">${meta.note}</p>`;
+    const rowGrid = document.createElement('div');
+    rowGrid.className = 'palette-grid';
+    for (const p of rows) rowGrid.appendChild(paletteRow(p));
+    section.appendChild(rowGrid);
+    regionsHost.appendChild(section);
+  }
   document.body.addEventListener('input', event => {
     const input = event.target.closest('input[type="color"]');
     if (!input || !input.dataset.key) return;
@@ -1382,11 +1498,11 @@ function buildRecolored() {
   if (Object.keys(images).length < totalImages) return;
 
   const lut = new Map();
-  const eyeLut = new Map();
+  const regionLut = new Map();
   for (const p of PALETTE) {
     const neu = state.get(stateKey(p)) || p.new;
     if (neu === p.orig) continue;
-    if (p.target === 'eye') eyeLut.set(p.orig, hexToRgb(neu));
+    if (p.target !== 'color') regionLut.set(stateKey(p), hexToRgb(neu));
     else lut.set(p.orig, hexToRgb(neu));
   }
 
@@ -1402,18 +1518,22 @@ function buildRecolored() {
     ctx.clearRect(0, 0, 32, 32);
     ctx.drawImage(img, 0, 0);
 
-    const eyeIndex = new Map();
-    for (const [orig, coords] of Object.entries(EYES[name] || {})) {
-      for (const [x, y] of coords) eyeIndex.set((y * 32 + x) * 4, orig);
+    const regionIndex = new Map();
+    for (const [target, byColor] of Object.entries(REGIONS[name] || {})) {
+      for (const [orig, coords] of Object.entries(byColor)) {
+        for (const [x, y] of coords) {
+          regionIndex.set((y * 32 + x) * 4, orig + '|' + target);
+        }
+      }
     }
 
-    if (lut.size || eyeLut.size) {
+    if (lut.size || regionLut.size) {
       const data = ctx.getImageData(0, 0, 32, 32);
       const px = data.data;
       let frameChanged = 0;
       for (let i = 0; i < px.length; i += 4) {
         if (px[i + 3] === 0) continue;
-        if (eyeIndex.has(i)) continue;
+        if (regionIndex.has(i)) continue;
         const key = rgbToHex(px[i], px[i + 1], px[i + 2]);
         const neu = lut.get(key);
         if (neu) {
@@ -1423,8 +1543,8 @@ function buildRecolored() {
           frameChanged++;
         }
       }
-      for (const [i, orig] of eyeIndex) {
-        const neu = eyeLut.get(orig);
+      for (const [i, key] of regionIndex) {
+        const neu = regionLut.get(key);
         if (!neu) continue;
         px[i] = neu[0];
         px[i + 1] = neu[1];

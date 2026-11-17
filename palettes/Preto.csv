@@ -1,0 +1,14 @@
+orig,new,role,target
+#DC9200,#27262C,sombreamento,color
+#966200,#1A191F,partes escuras,color
+#B97A00,#222128,sombra,color
+#503200,#0A0A0C,cascos/contorno,color
+#FFAA00,#2E2D34,quase geral,color
+#565656,#3A3941,pelo cinza,color
+#734A00,#141418,escuro (a definir),color
+#FFB848,#3A3941,partes claras,color
+#3E3E3E,#0F0F12,cinza escuro (a definir),color
+#FFD48E,#4A4952,brilho,color
+#626262,#4A4952,rabo/crina,color
+#734A00,#E8E8EC,olho,eye
+#503200,#0A0A0C,crina,mane
