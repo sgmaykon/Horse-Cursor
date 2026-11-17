@@ -62,8 +62,7 @@ EYE_LIGHT_COLORS: frozenset[tuple[int, int, int]] = frozenset(
 TARGET_COLOR = "color"
 TARGET_EYE = "eye"
 TARGET_MANE = "mane"
-TARGET_RABO = "rabo"
-TARGETS = {TARGET_COLOR, TARGET_EYE, TARGET_MANE, TARGET_RABO}
+TARGETS = {TARGET_COLOR, TARGET_EYE, TARGET_MANE}
 
 # A crina fica na parte superior do sprite. Consideramos "região da crina" os
 # pixels da cor alvo acima desta fração da altura opaca do cavalo. A detecção
@@ -75,14 +74,9 @@ MANE_TOP_RATIO = 0.35
 # linha `target=mane` para elas, permitindo recolorir cascos e crina separado.
 MANE_SOURCE_COLORS: tuple[tuple[int, int, int], ...] = ((0x50, 0x32, 0x00),)
 
-# Região do rabo: pixels na parte inferior do sprite. Consideramos "região do rabo"
-# os pixels abaixo desta fração da altura opaca do cavalo. A detecção usa o
-# bounding box de cada frame, então funciona quando o cavalo está deslocado.
-RABO_BOTTOM_RATIO = 0.75
-
-# Cores da arte original que também formam o rabo. O `--extract` cria uma
-# linha `target=rabo` para elas.
-RABO_SOURCE_COLORS: tuple[tuple[int, int, int], ...] = ((0x62, 0x62, 0x62),)
+# Cores da arte original que também formam a crina. O `--extract` cria uma
+# linha `target=mane` para elas, permitindo recolorir cascos e crina separado.
+MANE_SOURCE_COLORS: tuple[tuple[int, int, int], ...] = ((0x50, 0x32, 0x00),)
 
 # Cores que ficam fora do swap por padrão. Elas só entram se aparecerem
 # explicitamente no CSV de mapeamento.
@@ -105,7 +99,6 @@ KNOWN_ROLES: dict[tuple[int, int, int], str] = {
     (0xFF, 0xB8, 0x48): "partes claras",
     (0x3E, 0x3E, 0x3E): "cinza escuro (a definir)",
     (0xFF, 0xD4, 0x8E): "brilho",
-    (0x62, 0x62, 0x62): "rabo/crina",
 }
 
 
@@ -211,37 +204,9 @@ def find_mane_pixels(
     return hits
 
 
-def find_rabo_pixels(
-    im: Image.Image,
-    bottom_ratio: float = RABO_BOTTOM_RATIO,
-) -> list[tuple[int, int]]:
-    """Coordenadas do rabo: pixels na parte inferior do sprite.
-
-    Consideramos a região do rabo os pixels abaixo de `bottom_ratio`
-    da altura do bounding box opaco de cada frame.
-    """
-    im = im.convert("RGBA")
-    box = sprite_bbox(im)
-    if box is None:
-        return []
-
-    _minx, miny, _maxx, maxy = box
-    span = max(maxy - miny, 1)
-    threshold = miny + int(span * bottom_ratio)
-    px = im.load()
-    width, height = im.size
-    hits: list[tuple[int, int]] = []
-
-    for y in range(height):
-        if (y - miny) / span >= bottom_ratio:
-            # Only hit exact threshold pixels once
-            pass
-        for x in range(width):
-            r, g, b, a = px[x, y]
-            if a and (y - miny) / span >= bottom_ratio:
-                hits.append((x, y))
-
-    return hits
+def luminance(rgb: tuple[int, int, int]) -> float:
+    r, g, b = rgb
+    return 0.299 * r + 0.587 * g + 0.114 * b
 
 
 def find_region_pixels(
@@ -253,14 +218,7 @@ def find_region_pixels(
         return find_eye_pixels(im, rgb)
     if target == TARGET_MANE:
         return find_mane_pixels(im, rgb)
-    if target == TARGET_RABO:
-        return find_rabo_pixels(im)
     return []
-
-
-def luminance(rgb: tuple[int, int, int]) -> float:
-    r, g, b = rgb
-    return 0.299 * r + 0.587 * g + 0.114 * b
 
 
 def detect_eye_color(
@@ -383,9 +341,6 @@ def make_rows(counts: Counter) -> list[MapRow]:
         if rgb in IGNORED_COLORS:
             continue
         rows.append(MapRow(rgb, rgb, KNOWN_ROLES.get(rgb, "a definir")))
-    for rgb in RABO_SOURCE_COLORS:
-        if rgb in counts:
-            rows.append(MapRow(rgb, rgb, "rabo", TARGET_RABO))
     for rgb in MANE_SOURCE_COLORS:
         if rgb in counts:
             rows.append(MapRow(rgb, rgb, "crina", TARGET_MANE))
