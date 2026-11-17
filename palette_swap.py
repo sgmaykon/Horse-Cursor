@@ -1282,6 +1282,36 @@ button.secondary {
 button:hover { filter: brightness(1.08); }
 button:active { transform: translateY(1px); }
 #status { color: var(--muted); font-size: 0.9rem; }
+#export-status { font-size: 0.9rem; color: var(--muted); }
+#export-status[data-kind="ok"] { color: var(--ok); }
+#export-status[data-kind="error"] { color: var(--warn); }
+#export-status[data-kind="warn"] { color: var(--text); }
+#export-details {
+  margin-top: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+#export-details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+#export-details textarea {
+  margin-top: 10px;
+  width: 100%;
+  min-height: 120px;
+  resize: vertical;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  white-space: pre;
+}
 .cursors-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
@@ -1349,8 +1379,14 @@ footer {
     <label>Variante <input type="text" id="variant-name" value="MinhaCor" spellcheck="false" autocomplete="off"></label>
     <button type="button" id="reset" class="secondary">Reset</button>
     <button type="button" id="export">Exportar CSV</button>
+    <button type="button" id="copy-csv" class="secondary">Copiar CSV</button>
+    <span id="export-status" role="status" aria-live="polite"></span>
     <span id="status">carregando…</span>
   </div>
+  <details id="export-details">
+    <summary>Ver conteúdo do CSV</summary>
+    <textarea id="csv-text" readonly spellcheck="false"></textarea>
+  </details>
 </section>
 
 <div id="regions"></div>
@@ -1566,6 +1602,7 @@ function buildRecolored() {
 
   document.getElementById('status').textContent =
     `${changedPixels.toLocaleString('pt-BR')} pixels alterados em ${changedFrames} frames`;
+  syncCsvPreview();
 }
 
 let rebuildTimer = null;
@@ -1613,25 +1650,111 @@ document.getElementById('reset').addEventListener('click', () => {
   buildRecolored();
 });
 
-document.getElementById('export').addEventListener('click', () => {
+function variantFileName() {
   const rawName = document.getElementById('variant-name').value.trim() || 'variante';
   const name = rawName.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'variante';
+  return name + '.csv';
+}
+
+function csvText() {
   const lines = ['orig,new,role,target'];
   for (const p of PALETTE) {
     const neu = state.get(stateKey(p)) || p.orig;
     const role = String(p.role || '').replace(/"/g, '""');
     lines.push(`${p.orig},${neu},"${role}",${p.target || 'color'}`);
   }
-  const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = name + '.csv';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-});
+  return lines.join('\n') + '\n';
+}
+
+function setExportStatus(message, kind) {
+  const el = document.getElementById('export-status');
+  el.textContent = message;
+  el.dataset.kind = kind || '';
+}
+
+function syncCsvPreview() {
+  document.getElementById('csv-text').value = csvText();
+}
+
+async function exportCsv() {
+  const text = csvText();
+  syncCsvPreview();
+  const fileName = variantFileName();
+  const blob = new Blob([text], { type: 'text/csv;charset=utf-8' });
+
+  if (typeof window.showSaveFilePicker === 'function') {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: fileName,
+        types: [{ description: 'CSV', accept: { 'text/csv': ['.csv'] } }]
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      setExportStatus(`CSV salvo como ${handle.name || fileName}.`, 'ok');
+      return;
+    } catch (error) {
+      if (error && error.name === 'AbortError') {
+        setExportStatus('Exportação cancelada.', 'warn');
+        return;
+      }
+      console.warn('showSaveFilePicker indisponível, usando download:', error);
+    }
+  }
+
+  try {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setExportStatus(`Download iniciado: ${fileName} (pasta de downloads do navegador).`, 'ok');
+  } catch (error) {
+    console.error(error);
+    setExportStatus('Não foi possível baixar o arquivo. Use "Copiar CSV" ou copie o texto abaixo.', 'error');
+  }
+}
+
+async function copyCsv() {
+  const text = csvText();
+  syncCsvPreview();
+  let copied = false;
+
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    } catch (error) {
+      console.warn('navigator.clipboard falhou:', error);
+    }
+  }
+
+  if (!copied) {
+    const area = document.getElementById('csv-text');
+    document.getElementById('export-details').open = true;
+    area.focus();
+    area.select();
+    try {
+      copied = document.execCommand('copy');
+    } catch (error) {
+      console.warn('execCommand("copy") falhou:', error);
+    }
+  }
+
+  if (copied) {
+    setExportStatus('CSV copiado para a área de transferência.', 'ok');
+  } else {
+    document.getElementById('export-details').open = true;
+    setExportStatus('Não foi possível copiar automaticamente. Selecione o texto abaixo e copie manualmente.', 'error');
+  }
+}
+
+document.getElementById('export').addEventListener('click', exportCsv);
+document.getElementById('copy-csv').addEventListener('click', copyCsv);
 
 async function init() {
   buildPaletteUI();
