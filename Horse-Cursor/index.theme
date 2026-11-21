@@ -1,3 +1,7 @@
+# Version identifies the compiled theme release. The palette variant is part
+# of Name (e.g. "Horse-Cursor black"), and the generated index.theme records
+# X-Horse-Cursor-Variant, X-Horse-Cursor-Palette and X-Horse-Cursor-Hotspot.
 [Icon Theme]
 Name=Horse-Cursor
-Comment=Horse Cursor, for the horse lovers. Originally created by Shiminok: https://www.rw-designer.com/cursor-set/horses. I'm just porting it to Linux. If you want to rebuild the cursor with different frame durations, go here: https://github.com/sgmaykon/Horse-Cursor/tree/main/Horse-Cursor 
+Comment=Horse Cursor, for the horse lovers. Originally created by Shiminok: https://www.rw-designer.com/cursor-set/horses. I'm just porting it to Linux. If you want to rebuild the cursor with different frame durations, go here: https://github.com/sgmaykon/Horse-Cursor/tree/main/Horse-Cursor
+Version=1.0

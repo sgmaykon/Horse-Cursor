@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+build/
+dist/
+preview/
+recolored/
+
+# Pacotes gerados (publicados como GitHub Releases)
+releases/*
+!releases/.gitkeep
