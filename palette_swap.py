@@ -7,6 +7,7 @@ interativo e criar/instalar variantes do tema lado a lado.
 Exemplos:
     python3 palette_swap.py --extract
     python3 palette_swap.py --preview --map palette_map.csv
+    python3 palette_swap.py --viewer --map palettes/black.csv
     python3 palette_swap.py --build --variant Red --map palettes/Red.csv
     python3 palette_swap.py --build-all
     python3 palette_swap.py --install --variant Red
@@ -26,8 +27,8 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import zipfile
 from collections import Counter
+from html import escape as html_escape
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -782,13 +783,12 @@ def json_for_script(value) -> str:
     )
 
 
-def generate_html(
+def build_preview_payload(
     rows: list[MapRow],
     counts: Counter,
     sequences: dict[str, list[tuple[str, int]]],
-    out_path: Path,
     hotspots: dict[str, tuple[int, int]] | None = None,
-) -> None:
+) -> dict:
     frame_names = sorted(
         {filename for frames in sequences.values() for filename, _ in frames}
     )
@@ -863,17 +863,71 @@ def generate_html(
         "opaque_pixels": sum(counts.values()),
     }
 
-    html_text = HTML_TEMPLATE
-    html_text = html_text.replace("__PALETTE_JSON__", json_for_script(palette_data))
-    html_text = html_text.replace("__CURSORS_JSON__", json_for_script(cursor_data))
-    html_text = html_text.replace("__HOTSPOTS_JSON__", json_for_script(hotspot_data))
-    html_text = html_text.replace("__FRAMES_JSON__", json_for_script(frames_data))
-    html_text = html_text.replace("__IGNORED_JSON__", json_for_script(ignored_data))
-    html_text = html_text.replace("__REGIONS_JSON__", json_for_script(region_data))
-    html_text = html_text.replace("__META_JSON__", json_for_script(meta_data))
+    return {
+        "palette": palette_data,
+        "cursors": cursor_data,
+        "hotspots": hotspot_data,
+        "frames": frames_data,
+        "ignored": ignored_data,
+        "regions": region_data,
+        "meta": meta_data,
+    }
 
+
+def render_template(
+    template: str,
+    payload: dict,
+    out_path: Path,
+    extra_json: dict | None = None,
+    extra_text: dict | None = None,
+) -> None:
+    html_text = template
+    replacements = {
+        "__PALETTE_JSON__": payload["palette"],
+        "__CURSORS_JSON__": payload["cursors"],
+        "__HOTSPOTS_JSON__": payload["hotspots"],
+        "__FRAMES_JSON__": payload["frames"],
+        "__IGNORED_JSON__": payload["ignored"],
+        "__REGIONS_JSON__": payload["regions"],
+        "__META_JSON__": payload["meta"],
+    }
+    if extra_json:
+        replacements.update(extra_json)
+    for placeholder, value in replacements.items():
+        html_text = html_text.replace(placeholder, json_for_script(value))
+    for placeholder, value in (extra_text or {}).items():
+        html_text = html_text.replace(placeholder, value)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html_text, encoding="utf-8")
+
+
+def generate_html(
+    rows: list[MapRow],
+    counts: Counter,
+    sequences: dict[str, list[tuple[str, int]]],
+    out_path: Path,
+    hotspots: dict[str, tuple[int, int]] | None = None,
+) -> None:
+    payload = build_preview_payload(rows, counts, sequences, hotspots)
+    render_template(HTML_TEMPLATE, payload, out_path)
+
+
+def generate_viewer(
+    rows: list[MapRow],
+    counts: Counter,
+    sequences: dict[str, list[tuple[str, int]]],
+    out_path: Path,
+    hotspots: dict[str, tuple[int, int]] | None = None,
+    palette_name: str = "",
+) -> None:
+    payload = build_preview_payload(rows, counts, sequences, hotspots)
+    render_template(
+        VIEWER_TEMPLATE,
+        payload,
+        out_path,
+        extra_json={"__PALETTE_NAME_JSON__": palette_name},
+        extra_text={"__PALETTE_NAME_HTML__": html_escape(palette_name)},
+    )
 
 
 def validate_variant(variant: str) -> None:
@@ -1098,24 +1152,31 @@ def cmd_extract(args: argparse.Namespace) -> None:
             print(f"       {label}")
 
 
-def cmd_preview(args: argparse.Namespace) -> None:
-    files, counts = scan_images()
+def resolve_map_rows(
+    args: argparse.Namespace, files: list[Path], counts: Counter
+) -> tuple[Path, list[MapRow]]:
     map_path = Path(args.map).expanduser() if args.map else DEFAULT_MAP
 
     if map_path.exists():
-        map_rows = read_map(map_path)
-    elif args.map:
+        return map_path, read_map(map_path)
+    if args.map:
         raise SystemExit(f"[erro] Mapa não encontrado: {map_path}")
-    else:
-        map_rows = make_rows(counts)
-        eye = detect_eye_color(files)
-        if eye is not None:
-            map_rows.append(MapRow(eye, eye, "olho", TARGET_EYE))
-        for rgb in MANE_SOURCE_COLORS:
-            if rgb in counts:
-                map_rows.append(MapRow(rgb, rgb, "crina", TARGET_MANE))
-        write_map(map_path, map_rows)
-        print(f"[ok] {map_path} criado a partir das cores atuais.")
+
+    map_rows = make_rows(counts)
+    eye = detect_eye_color(files)
+    if eye is not None:
+        map_rows.append(MapRow(eye, eye, "olho", TARGET_EYE))
+    for rgb in MANE_SOURCE_COLORS:
+        if rgb in counts:
+            map_rows.append(MapRow(rgb, rgb, "crina", TARGET_MANE))
+    write_map(map_path, map_rows)
+    print(f"[ok] {map_path} criado a partir das cores atuais.")
+    return map_path, map_rows
+
+
+def cmd_preview(args: argparse.Namespace) -> None:
+    files, counts = scan_images()
+    map_path, map_rows = resolve_map_rows(args, files, counts)
 
     PALETTES_DIR.mkdir(exist_ok=True)
     validate_map(map_rows, counts, strict=False)
@@ -1152,6 +1213,31 @@ def cmd_preview(args: argparse.Namespace) -> None:
     print(f"[ok] Preview: {html_path}")
     print(f"[ok] Contact sheet: {sheet_path}")
     print(f"     Abra com: xdg-open {html_path}")
+
+
+def cmd_viewer(args: argparse.Namespace) -> None:
+    files, counts = scan_images()
+    map_path, map_rows = resolve_map_rows(args, files, counts)
+    validate_map(map_rows, counts, strict=False)
+
+    cursors = parse_cursors()
+    hotspots = resolve_hotspots(cursors, align=not args.no_align)
+    sequences = {cursor.name: list(cursor.frames) for cursor in cursors}
+    viewer_rows = build_preview_rows(map_rows, counts)
+
+    out_path = PREVIEW_DIR / "viewer.html"
+    generate_viewer(
+        viewer_rows,
+        counts,
+        sequences,
+        out_path,
+        hotspots,
+        palette_name=map_path.name,
+    )
+
+    print(f"[ok] Viewer: {out_path}")
+    print(f"     Paleta: {map_path}")
+    print(f"     Abra com: xdg-open {out_path}")
 
 
 def cmd_build(args: argparse.Namespace) -> None:
@@ -1222,41 +1308,9 @@ def cmd_install(args: argparse.Namespace) -> None:
     )
 
 
-def package_tar(src: Path, out: Path, compress: bool = False) -> None:
-    mode = "w:gz" if compress else "w"
-    with tarfile.open(out, mode) as tar:
+def package_tar_gz(src: Path, out: Path) -> None:
+    with tarfile.open(out, "w:gz") as tar:
         tar.add(src, arcname=src.name)
-
-
-def package_zip(src: Path, out: Path) -> None:
-    """Zip preserving symlinks and file modes (Unix attributes)."""
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, dirs, files in os.walk(src, followlinks=False):
-            root_path = Path(root)
-            dirs.sort()
-            files.sort()
-
-            for dirname in dirs:
-                path = root_path / dirname
-                if not path.is_symlink():
-                    continue
-                arcname = str(Path(src.name) / path.relative_to(src))
-                add_zip_symlink(zf, path, arcname)
-
-            for filename in files:
-                path = root_path / filename
-                arcname = str(Path(src.name) / path.relative_to(src))
-                if path.is_symlink():
-                    add_zip_symlink(zf, path, arcname)
-                else:
-                    zf.write(path, arcname)
-
-
-def add_zip_symlink(zf: zipfile.ZipFile, path: Path, arcname: str) -> None:
-    info = zipfile.ZipInfo(arcname)
-    info.create_system = 3  # Unix
-    info.external_attr = (0o120777 << 16) | 0o777
-    zf.writestr(info, os.readlink(path))
 
 
 def cmd_package(args: argparse.Namespace) -> None:
@@ -1271,19 +1325,10 @@ def cmd_package(args: argparse.Namespace) -> None:
             f"       Rode --build --variant {args.variant} primeiro."
         )
 
-    formats = args.package_format or ["tar.gz"]
     RELEASES_DIR.mkdir(parents=True, exist_ok=True)
-    for fmt in formats:
-        if fmt == "zip":
-            out = RELEASES_DIR / f"Horse-Cursor-{args.variant}.zip"
-            package_zip(src, out)
-        elif fmt == "tar":
-            out = RELEASES_DIR / f"Horse-Cursor-{args.variant}.tar"
-            package_tar(src, out, compress=False)
-        else:
-            out = RELEASES_DIR / f"Horse-Cursor-{args.variant}.tar.gz"
-            package_tar(src, out, compress=True)
-        print(f"[ok] Pacote: {out}")
+    out = RELEASES_DIR / f"Horse-Cursor-{args.variant}.tar.gz"
+    package_tar_gz(src, out)
+    print(f"[ok] Pacote: {out}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1302,6 +1347,13 @@ def main(argv: list[str] | None = None) -> int:
         "--preview",
         action="store_true",
         help="gera preview/index.html + contact_sheet.png",
+    )
+    group.add_argument(
+        "--viewer",
+        "--colorswap",
+        action="store_true",
+        dest="viewer",
+        help="gera preview/viewer.html (só o colorswap, com carregamento de CSV)",
     )
     group.add_argument(
         "--build", action="store_true", help="cria uma variante do tema"
@@ -1343,12 +1395,6 @@ def main(argv: list[str] | None = None) -> int:
         help="aborta se alguma cor opaca ficar fora do mapa",
     )
     parser.add_argument(
-        "--package-format",
-        action="append",
-        choices=["tar.gz", "tar", "zip"],
-        help="formato do pacote (pode repetir; padrão: tar.gz)",
-    )
-    parser.add_argument(
         "--force",
         action="store_true",
         help="sobrescreve o CSV no --extract",
@@ -1364,6 +1410,8 @@ def main(argv: list[str] | None = None) -> int:
         cmd_extract(args)
     elif args.preview:
         cmd_preview(args)
+    elif args.viewer:
+        cmd_viewer(args)
     elif args.build:
         cmd_build(args)
     elif args.build_all:
@@ -1374,6 +1422,643 @@ def main(argv: list[str] | None = None) -> int:
         cmd_package(args)
     return 0
 
+
+VIEWER_TEMPLATE = r"""<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Horse Cursor — Colorswap</title>
+<style>
+:root {
+  --bg: #151515;
+  --panel: #202020;
+  --panel-2: #2a2a2a;
+  --text: #ededed;
+  --muted: #a0a0a0;
+  --accent: #f0a500;
+  --border: #373737;
+  --ok: #7fb069;
+  --warn: #e0a458;
+  --error: #ff6b6b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 24px;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+code {
+  background: #333;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+}
+header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 16px;
+}
+h1 { margin: 0 0 6px; font-size: 1.5rem; }
+h1 .accent { color: var(--accent); font-weight: 500; }
+.sub { margin: 0; color: var(--muted); font-size: 0.9rem; }
+.status-box {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  font-size: 0.82rem;
+}
+#summary { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+#csv-status[data-kind="ok"] { color: var(--ok); }
+#csv-status[data-kind="warn"] { color: var(--warn); }
+#csv-status[data-kind="error"] { color: var(--error); }
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 18px 0 4px;
+}
+.file-button, button {
+  display: inline-flex;
+  align-items: center;
+  background: var(--accent);
+  color: #1a1a1a;
+  border: 0;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.file-button:hover, button:hover { filter: brightness(1.08); }
+button.ghost {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 0.88rem;
+  cursor: pointer;
+  margin-left: auto;
+}
+h2 {
+  margin: 30px 0 12px;
+  font-size: 1.05rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+}
+.legend {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: 6px 14px;
+}
+.legend-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 0.82rem;
+}
+.legend-row.region { border-color: #5a4a22; }
+.swatch {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  border: 1px solid #0c0c0c;
+  flex: 0 0 auto;
+}
+.arrow { color: var(--muted); }
+.legend-row .hex {
+  background: none;
+  padding: 0;
+  font-size: 0.82rem;
+  min-width: 66px;
+}
+.legend-row .role {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+.badge {
+  background: #3b3222;
+  color: #e9bd6a;
+  border-radius: 99px;
+  padding: 2px 8px;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.legend-row .count {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+.warn { color: var(--error); font-size: 0.72rem; }
+.cursors-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 12px;
+}
+.cursor-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+}
+.cursor-card h3 {
+  margin: 0 0 10px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.anim-pair { display: flex; gap: 16px; justify-content: center; }
+.anim { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.anim span {
+  font-size: 0.72rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.anim canvas {
+  width: 144px;
+  height: 144px;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background-color: #333;
+  background-image:
+    linear-gradient(45deg, #444 25%, transparent 25%),
+    linear-gradient(-45deg, #444 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #444 75%),
+    linear-gradient(-45deg, transparent 75%, #444 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+body.only-new .before-wrap { display: none; }
+.hotspot {
+  margin: 10px 0 0;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+footer {
+  margin-top: 36px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 10, 10, 0.82);
+  border: 3px dashed var(--accent);
+  color: var(--text);
+  font-size: 1.2rem;
+  z-index: 10;
+  pointer-events: none;
+}
+body.dragging .drop-overlay { display: flex; }
+@media (max-width: 600px) {
+  body { padding: 12px; }
+  .anim canvas { width: 108px; height: 108px; }
+  .anim-pair { gap: 8px; }
+  .toggle { margin-left: 0; }
+}
+</style>
+</head>
+<body>
+<div class="drop-overlay"><span>Solte o CSV para visualizar</span></div>
+
+<header>
+  <div>
+    <h1>Horse-Cursor <span class="accent">colorswap</span></h1>
+    <p class="sub">Só o resultado da troca de cores. Paleta: <code id="palette-name">__PALETTE_NAME_HTML__</code></p>
+  </div>
+  <div class="status-box">
+    <span id="summary">carregando frames…</span>
+    <span id="csv-status" role="status" aria-live="polite"></span>
+  </div>
+</header>
+
+<div class="toolbar">
+  <label class="file-button" for="csv-file">Carregar CSV</label>
+  <input type="file" id="csv-file" accept=".csv,text/csv" hidden>
+  <button type="button" id="reset" class="ghost">Paleta padrão</button>
+  <label class="toggle"><input type="checkbox" id="compare-toggle" checked> Comparar com original</label>
+</div>
+
+<h2>Paleta aplicada</h2>
+<div class="legend" id="palette-legend"></div>
+<p class="note" id="ignored-note"></p>
+
+<h2>Cursores</h2>
+<div class="cursors-grid" id="cursors-grid"></div>
+
+<footer>
+  Gerado por <code>palette_swap.py --viewer</code> · <span id="meta"></span>
+</footer>
+
+<script>
+const PALETTE = __PALETTE_JSON__;
+const CURSORS = __CURSORS_JSON__;
+const HOTSPOTS = __HOTSPOTS_JSON__;
+const FRAMES = __FRAMES_JSON__;
+const IGNORED = __IGNORED_JSON__;
+const REGIONS = __REGIONS_JSON__;
+const META = __META_JSON__;
+const PALETTE_NAME = __PALETTE_NAME_JSON__;
+
+const CANVAS_SIZE = 36;
+const ANCHOR_X = 2;
+const ANCHOR_Y = 12;
+
+const images = {};
+const recolored = new Map();
+const stateKey = p => p.orig + '|' + p.target;
+const state = new Map(PALETTE.map(p => [stateKey(p), p.new]));
+const totalImages = Object.keys(FRAMES).length;
+
+function esc(value) {
+  return String(value).replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+function rgbToHex(r, g, b) {
+  return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+}
+
+function setCsvStatus(message, kind) {
+  const el = document.getElementById('csv-status');
+  el.textContent = message;
+  el.dataset.kind = kind || '';
+}
+
+function buildLegend() {
+  const host = document.getElementById('palette-legend');
+  for (const p of PALETTE) {
+    const key = stateKey(p);
+    const row = document.createElement('div');
+    row.className = 'legend-row' + (p.target !== 'color' ? ' region' : '');
+    row.dataset.key = key;
+    row.innerHTML = `
+      <span class="swatch orig" style="background:${p.orig}" title="Original ${p.orig}"></span>
+      <span class="arrow">→</span>
+      <span class="swatch new" style="background:${p.new}" title="Nova ${p.new}"></span>
+      <code class="hex">${p.new}</code>
+      <span class="role">${esc(p.role || '—')}</span>
+      ${p.target !== 'color' ? `<span class="badge">${esc(p.target)}</span>` : ''}
+      <span class="count">${p.count.toLocaleString('pt-BR')} px</span>
+      ${p.found ? '' : '<span class="warn">ausente</span>'}`;
+    host.appendChild(row);
+  }
+  if (IGNORED.length) {
+    document.getElementById('ignored-note').textContent =
+      'Fora do swap por padrão: ' + IGNORED.join(' · ') + '.';
+  } else {
+    document.getElementById('ignored-note').textContent =
+      'Todas as cores opacas dos PNGs estão na paleta.';
+  }
+}
+
+function updateLegend(key, value) {
+  const row = document.querySelector(`.legend-row[data-key="${CSS.escape(key)}"]`);
+  if (!row) return;
+  row.querySelector('.new').style.background = value;
+  row.querySelector('.hex').textContent = value;
+}
+
+function buildCursorCards() {
+  const grid = document.getElementById('cursors-grid');
+  for (const name of Object.keys(CURSORS)) {
+    const card = document.createElement('div');
+    card.className = 'cursor-card';
+    card.dataset.cursor = name;
+    const hot = HOTSPOTS[name] || [0, 0];
+    card.innerHTML = `
+      <h3>${esc(name)}</h3>
+      <div class="anim-pair">
+        <div class="anim before-wrap"><span>Original</span><canvas class="before" width="${CANVAS_SIZE}" height="${CANVAS_SIZE}"></canvas></div>
+        <div class="anim"><span>Recolorido</span><canvas class="after" width="${CANVAS_SIZE}" height="${CANVAS_SIZE}"></canvas></div>
+      </div>
+      <p class="hotspot">ponteiro em (${hot[0]}, ${hot[1]})</p>`;
+    grid.appendChild(card);
+  }
+}
+
+function loadImages() {
+  return Promise.all(Object.entries(FRAMES).map(([name, url]) => new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => { images[name] = img; resolve(); };
+    img.onerror = () => reject(new Error('falha ao carregar ' + name));
+    img.src = url;
+  })));
+}
+
+function buildRecolored() {
+  if (Object.keys(images).length < totalImages) return;
+
+  const lut = new Map();
+  const regionLut = new Map();
+  for (const p of PALETTE) {
+    const neu = state.get(stateKey(p)) || p.new;
+    if (neu === p.orig) continue;
+    if (p.target !== 'color') regionLut.set(stateKey(p), hexToRgb(neu));
+    else lut.set(p.orig, hexToRgb(neu));
+  }
+
+  recolored.clear();
+  let changedPixels = 0;
+  let changedFrames = 0;
+
+  for (const [name, img] of Object.entries(images)) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 32;
+    canvas.height = 32;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.clearRect(0, 0, 32, 32);
+    ctx.drawImage(img, 0, 0);
+
+    const regionIndex = new Map();
+    for (const [target, byColor] of Object.entries(REGIONS[name] || {})) {
+      for (const [orig, coords] of Object.entries(byColor)) {
+        for (const [x, y] of coords) {
+          regionIndex.set((y * 32 + x) * 4, orig + '|' + target);
+        }
+      }
+    }
+
+    if (lut.size || regionLut.size) {
+      const data = ctx.getImageData(0, 0, 32, 32);
+      const px = data.data;
+      let frameChanged = 0;
+      for (let i = 0; i < px.length; i += 4) {
+        if (px[i + 3] === 0) continue;
+        if (regionIndex.has(i)) continue;
+        const key = rgbToHex(px[i], px[i + 1], px[i + 2]);
+        const neu = lut.get(key);
+        if (neu) {
+          px[i] = neu[0];
+          px[i + 1] = neu[1];
+          px[i + 2] = neu[2];
+          frameChanged++;
+        }
+      }
+      for (const [i, key] of regionIndex) {
+        const neu = regionLut.get(key);
+        if (!neu) continue;
+        px[i] = neu[0];
+        px[i + 1] = neu[1];
+        px[i + 2] = neu[2];
+        frameChanged++;
+      }
+      if (frameChanged) {
+        ctx.putImageData(data, 0, 0);
+        changedPixels += frameChanged;
+        changedFrames++;
+      }
+    }
+
+    recolored.set(name, canvas);
+  }
+
+  document.getElementById('summary').textContent =
+    `${changedPixels.toLocaleString('pt-BR')} pixels alterados em ${changedFrames} frames · ${Object.keys(CURSORS).length} cursores`;
+}
+
+let rebuildTimer = null;
+function scheduleRebuild() {
+  clearTimeout(rebuildTimer);
+  rebuildTimer = setTimeout(buildRecolored, 40);
+}
+
+function frameOffset(name) {
+  const [hx, hy] = HOTSPOTS[name] || [0, 0];
+  return [ANCHOR_X - hx, ANCHOR_Y - hy];
+}
+
+function drawCursorFrame(ctx, name, image) {
+  const [dx, dy] = frameOffset(name);
+  ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(dx + 0.5, dy + 0.5, 32, 32);
+  if (image) ctx.drawImage(image, dx, dy);
+}
+
+function startAnimations() {
+  for (const card of document.querySelectorAll('.cursor-card')) {
+    const name = card.dataset.cursor;
+    const seq = CURSORS[name];
+    if (!seq || !seq.length) continue;
+
+    const before = card.querySelector('canvas.before');
+    const after = card.querySelector('canvas.after');
+    const bctx = before.getContext('2d');
+    const actx = after.getContext('2d');
+    let index = 0;
+
+    const step = () => {
+      const [file, delay] = seq[index % seq.length];
+      card.dataset.frame = file;
+      drawCursorFrame(bctx, name, images[file]);
+      drawCursorFrame(actx, name, recolored.get(file));
+      index++;
+      setTimeout(step, delay);
+    };
+
+    step();
+  }
+}
+
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      row.push(field);
+      field = '';
+    } else if (ch === '\n') {
+      row.push(field);
+      field = '';
+      rows.push(row);
+      row = [];
+    } else if (ch !== '\r') {
+      field += ch;
+    }
+  }
+
+  if (field !== '' || row.length) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows;
+}
+
+function normalizeHex(value) {
+  const raw = String(value || '').trim().replace(/^#/, '').toUpperCase();
+  return /^[0-9A-F]{6}$/.test(raw) ? '#' + raw : null;
+}
+
+function applyCsv(text) {
+  const rows = parseCsv(text.replace(/^\uFEFF/, '')).filter(
+    row => row.length && row.some(cell => cell.trim() !== '')
+  );
+  const first = String(rows[0]?.[0] ?? '').trim().toLowerCase();
+  const start = first === 'orig' ? 1 : 0;
+  let applied = 0;
+  const missing = [];
+  const invalid = [];
+
+  for (const row of rows.slice(start)) {
+    if (row.length < 2) continue;
+    const orig = normalizeHex(row[0]);
+    const neu = normalizeHex(row[1]);
+    if (!orig || !neu) {
+      invalid.push(row.join(','));
+      continue;
+    }
+    const target = (row[3] || 'color').trim().toLowerCase() || 'color';
+    const key = orig + '|' + target;
+    if (!state.has(key)) {
+      missing.push(target === 'color' ? orig : `${orig} [${target}]`);
+      continue;
+    }
+    state.set(key, neu);
+    updateLegend(key, neu);
+    applied++;
+  }
+
+  if (applied) buildRecolored();
+  return { applied, missing, invalid };
+}
+
+function describe(result) {
+  const parts = [`${result.applied} linhas aplicadas`];
+  if (result.missing.length) parts.push(`${result.missing.length} fora da paleta`);
+  if (result.invalid.length) parts.push(`${result.invalid.length} inválidas`);
+  return parts.join(' · ');
+}
+
+function readCsvFile(file) {
+  if (!file) return;
+  file.text().then(text => {
+    const result = applyCsv(text);
+    const kind = result.applied ? (result.missing.length || result.invalid.length ? 'warn' : 'ok') : 'error';
+    setCsvStatus(`${file.name}: ${describe(result)}.`, kind);
+    document.getElementById('palette-name').textContent = file.name;
+    if (result.missing.length) console.warn('Linhas fora da paleta:', result.missing);
+    if (result.invalid.length) console.warn('Linhas inválidas:', result.invalid);
+  }).catch(error => {
+    console.error(error);
+    setCsvStatus('Não foi possível ler o CSV: ' + error.message, 'error');
+  });
+}
+
+document.getElementById('csv-file').addEventListener('change', event => {
+  const input = event.target;
+  readCsvFile(input.files && input.files[0]);
+  input.value = '';
+});
+
+document.getElementById('reset').addEventListener('click', () => {
+  for (const p of PALETTE) {
+    state.set(stateKey(p), p.new);
+    updateLegend(stateKey(p), p.new);
+  }
+  buildRecolored();
+  document.getElementById('palette-name').textContent = PALETTE_NAME;
+  setCsvStatus('Paleta padrão restaurada.', 'ok');
+});
+
+document.getElementById('compare-toggle').addEventListener('change', event => {
+  document.body.classList.toggle('only-new', !event.target.checked);
+});
+
+let dragDepth = 0;
+window.addEventListener('dragenter', event => {
+  event.preventDefault();
+  dragDepth++;
+  document.body.classList.add('dragging');
+});
+window.addEventListener('dragover', event => event.preventDefault());
+window.addEventListener('dragleave', event => {
+  event.preventDefault();
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) document.body.classList.remove('dragging');
+});
+window.addEventListener('drop', event => {
+  event.preventDefault();
+  dragDepth = 0;
+  document.body.classList.remove('dragging');
+  const file = event.dataTransfer.files && event.dataTransfer.files[0];
+  readCsvFile(file);
+});
+
+document.getElementById('meta').textContent =
+  `${META.frame_count} frames · ${META.cursor_count} cursores · ${META.opaque_pixels.toLocaleString('pt-BR')} pixels opacos`;
+
+buildLegend();
+buildCursorCards();
+loadImages().then(() => {
+  buildRecolored();
+  startAnimations();
+}).catch(error => {
+  console.error(error);
+  setCsvStatus('Falha ao carregar os frames: ' + error.message, 'error');
+});
+</script>
+</body>
+</html>
+"""
 
 HTML_TEMPLATE = r"""<!doctype html>
 <html lang="pt-BR">

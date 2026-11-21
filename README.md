@@ -9,7 +9,7 @@ The number at the end, '35', is the time in **milliseconds** that will take to c
 
 ## Palette swap / color variants
 
-`palette_swap.py` recolors the PNGs, generates an interactive before/after preview, and builds/installs color variants of the theme side by side.
+`palette_swap.py` recolors the PNGs, generates an interactive before/after preview (plus a standalone colorswap viewer), and builds/installs color variants of the theme side by side.
 
 Requirements: Python 3.9+, Pillow (`python3 -m pip install Pillow`) and `xcursorgen`.
 
@@ -38,6 +38,17 @@ Other buttons in the preview:
 - **Ver conteúdo do CSV** — shows the live CSV text so it can be checked or copied by hand.
 
 The **Olho** and **Crina** sections are separate: their pickers change only the eye pixel and the mane pixels in every frame, even when the rest of the horse uses the same original color. The hex code of the selected color is shown above each picker.
+
+### 2b. Standalone colorswap viewer
+
+To check only the result of a CSV — no color pickers, no export — generate the separate viewer:
+
+```bash
+python3 palette_swap.py --viewer --map palettes/black.csv
+xdg-open preview/viewer.html
+```
+
+`--viewer` and `--colorswap` are aliases. The page shows the original and the recolored animation side by side for all 13 cursors, a read-only palette legend with pixel counts, and the hotspot used for each cursor. The **Carregar CSV** button (or dragging a `.csv` onto the page) swaps the palette live; **Paleta padrão** restores the palette used to generate the page, and **Comparar com original** toggles between side-by-side and recolored-only.
 
 ### The CSV format
 
@@ -101,16 +112,15 @@ Then select **Horse-Cursor Red** in your desktop's cursor settings. Each variant
 
 ```bash
 python3 palette_swap.py --package --variant Red
-python3 palette_swap.py --package --variant Red --package-format tar --package-format zip
 ```
 
-Formats: `tar.gz` (default), `tar` and `zip`. Archives are written to `releases/`. The archive contains the `Horse-Cursor-<Variant>/` folder with `index.theme` and `cursors/`: the compiled `Cursor-Horse-*` files plus all action symlinks (`default`, `pointer`, `move`, `v_double_arrow`, ...). Symlinks are stored as symlinks in both `.tar` and `.zip`.
+Releases are always published as `.tar.gz` (`releases/Horse-Cursor-<Variant>.tar.gz`). The archive contains the `Horse-Cursor-<Variant>/` folder with `index.theme` and `cursors/`: the compiled `Cursor-Horse-*` files plus all action symlinks (`default`, `pointer`, `move`, `v_double_arrow`, ...). Symlinks are stored as symlinks.
 
 The original artwork can also be packaged with the corrected hotspots:
 
 ```bash
 python3 palette_swap.py --build --variant original --map palette_map.csv
-python3 palette_swap.py --package --variant original --package-format tar --package-format zip
+python3 palette_swap.py --package --variant original
 ```
 
 ### Versioning
