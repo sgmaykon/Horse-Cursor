@@ -1628,7 +1628,7 @@ h2 {
   font-weight: 600;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
-.anim-pair { display: flex; gap: 16px; justify-content: center; }
+.anim-pair { display: flex; gap: 16px; justify-content: center; align-items: flex-end; }
 .anim { display: flex; flex-direction: column; align-items: center; gap: 6px; }
 .anim span {
   font-size: 0.72rem;
@@ -1653,13 +1653,6 @@ h2 {
   background-position: 0 0, 0 8px, 8px -8px, -8px 0;
 }
 body.only-new .before-wrap { display: none; }
-.hotspot {
-  margin: 10px 0 0;
-  text-align: center;
-  color: var(--muted);
-  font-size: 0.75rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
 footer {
   margin-top: 36px;
   color: var(--muted);
@@ -1802,14 +1795,12 @@ function buildCursorCards() {
     const card = document.createElement('div');
     card.className = 'cursor-card';
     card.dataset.cursor = name;
-    const hot = HOTSPOTS[name] || [0, 0];
     card.innerHTML = `
       <h3>${esc(name)}</h3>
       <div class="anim-pair">
         <div class="anim before-wrap"><span>Original</span><canvas class="before" width="${CANVAS_SIZE}" height="${CANVAS_SIZE}"></canvas></div>
-        <div class="anim"><span>Recolorido</span><canvas class="after" width="${CANVAS_SIZE}" height="${CANVAS_SIZE}"></canvas></div>
-      </div>
-      <p class="hotspot">ponteiro em (${hot[0]}, ${hot[1]})</p>`;
+        <div class="anim"><canvas class="after" width="${CANVAS_SIZE}" height="${CANVAS_SIZE}"></canvas></div>
+      </div>`;
     grid.appendChild(card);
   }
 }
