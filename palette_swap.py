@@ -20,11 +20,13 @@ import base64
 import csv
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tarfile
+import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -465,16 +467,91 @@ def validate_map(
     return unmapped, unknown
 
 
+@dataclass(frozen=True)
+class CursorDef:
+    name: str
+    path: Path
+    frames: tuple[tuple[str, int], ...]
+    hotspot: tuple[int, int]
+
+
+def nose_anchor(im: Image.Image) -> tuple[int, int] | None:
+    """Ponto de referência do focinho: coluna opaca mais à esquerda e a base
+    da pontinha (primeiro trecho contínuo de pixels dessa coluna).
+
+    É a mesma referência usada pelos hotspots originais da maioria dos
+    cursores. Assim o cavalo fica sempre na mesma posição relativa ao ponteiro.
+    """
+    im = im.convert("RGBA")
+    px = im.load()
+    width, height = im.size
+
+    for x in range(width):
+        ys = [y for y in range(height) if px[x, y][3]]
+        if not ys:
+            continue
+        bottom = ys[0]
+        for y in ys[1:]:
+            if y != bottom + 1:
+                break
+            bottom = y
+        return (x, bottom)
+    return None
+
+
+def resolve_hotspots(
+    cursors: list[CursorDef],
+    align: bool = True,
+) -> dict[str, tuple[int, int]]:
+    """Hotspot final de cada cursor.
+
+    Com `align`, usa o focinho do primeiro frame (pose de repouso) como âncora
+    fixa da sequência. Sem `align`, mantém o hotspot original do arquivo
+    `.cursor`.
+    """
+    hotspots: dict[str, tuple[int, int]] = {}
+    for cursor in cursors:
+        anchor = None
+        if align and cursor.frames:
+            first = cursor.path.parent / cursor.frames[0][0]
+            anchor = nose_anchor(Image.open(first))
+        hotspots[cursor.name] = anchor or cursor.hotspot
+    return hotspots
+
+
+def write_cursor_config(
+    cursor: CursorDef,
+    hotspot: tuple[int, int],
+    out_path: Path,
+) -> None:
+    """Escreve uma cópia do `.cursor` com o hotspot alinhado.
+
+    As linhas inválidas/comentários são preservadas como estão.
+    """
+    xhot, yhot = hotspot
+    lines: list[str] = []
+    for raw_line in cursor.path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        parts = line.split()
+        if len(parts) >= 5:
+            size, filename, delay = parts[0], parts[-2], parts[-1]
+            lines.append(f"{size} {xhot} {yhot} {filename} {delay}")
+        else:
+            lines.append(raw_line)
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def parse_cursors(
     src_dir: Path = SRC_DIR,
-) -> tuple[list[Path], dict[str, list[tuple[str, int]]]]:
+) -> list[CursorDef]:
     cursor_files = sorted(src_dir.glob("*.cursor"))
     if not cursor_files:
         raise SystemExit(f"[erro] Nenhum .cursor encontrado em {src_dir}")
 
-    sequences: dict[str, list[tuple[str, int]]] = {}
+    cursors: list[CursorDef] = []
     for cursor_file in cursor_files:
         frames: list[tuple[str, int]] = []
+        hotspot: tuple[int, int] | None = None
         for lineno, raw_line in enumerate(
             cursor_file.read_text(encoding="utf-8").splitlines(), start=1
         ):
@@ -489,9 +566,11 @@ def parse_cursors(
             filename = parts[-2]
             try:
                 delay = int(parts[-1])
+                if hotspot is None:
+                    hotspot = (int(parts[1]), int(parts[2]))
             except ValueError:
                 raise SystemExit(
-                    f"[erro] {cursor_file}:{lineno}: delay inválido: {parts[-1]!r}"
+                    f"[erro] {cursor_file}:{lineno}: valor inválido: {raw_line!r}"
                 )
             if not (src_dir / filename).exists():
                 raise SystemExit(
@@ -501,9 +580,17 @@ def parse_cursors(
 
         if not frames:
             raise SystemExit(f"[erro] {cursor_file}: nenhum frame")
-        sequences[cursor_file.stem] = frames
+        cursors.append(
+            CursorDef(
+                name=cursor_file.stem,
+                path=cursor_file,
+                frames=tuple(frames),
+                hotspot=hotspot or (0, 0),
+            )
+        )
 
-    return cursor_files, sequences
+    return cursors
+
 
 
 def build_preview_rows(rows: list[MapRow], counts: Counter) -> list[MapRow]:
@@ -695,6 +782,7 @@ def generate_html(
     counts: Counter,
     sequences: dict[str, list[tuple[str, int]]],
     out_path: Path,
+    hotspots: dict[str, tuple[int, int]] | None = None,
 ) -> None:
     frame_names = sorted(
         {filename for frames in sequences.values() for filename, _ in frames}
@@ -751,6 +839,12 @@ def generate_html(
         for name, frames in sequences.items()
     }
 
+    hotspot_data = {
+        name: list(hotspots[name])
+        for name in sequences
+        if hotspots and name in hotspots
+    }
+
     ignored_data = [
         label
         for rgb, label in IGNORED_COLORS.items()
@@ -767,6 +861,7 @@ def generate_html(
     html_text = HTML_TEMPLATE
     html_text = html_text.replace("__PALETTE_JSON__", json_for_script(palette_data))
     html_text = html_text.replace("__CURSORS_JSON__", json_for_script(cursor_data))
+    html_text = html_text.replace("__HOTSPOTS_JSON__", json_for_script(hotspot_data))
     html_text = html_text.replace("__FRAMES_JSON__", json_for_script(frames_data))
     html_text = html_text.replace("__IGNORED_JSON__", json_for_script(ignored_data))
     html_text = html_text.replace("__REGIONS_JSON__", json_for_script(region_data))
@@ -809,7 +904,12 @@ def update_index_theme(path: Path, variant: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def build_variant(variant: str, map_path: Path, strict: bool = False) -> Path:
+def build_variant(
+    variant: str,
+    map_path: Path,
+    strict: bool = False,
+    align: bool = True,
+) -> Path:
     validate_variant(variant)
     if shutil.which("xcursorgen") is None:
         raise SystemExit(
@@ -838,16 +938,19 @@ def build_variant(variant: str, map_path: Path, strict: bool = False) -> Path:
         region_changed.update(frame_region_changed)
         im.save(build_dir / src.name)
 
-    cursor_files, _sequences = parse_cursors()
-    for cursor_file in cursor_files:
-        shutil.copy2(cursor_file, build_dir / cursor_file.name)
+    cursors = parse_cursors()
+    hotspots = resolve_hotspots(cursors, align=align)
+    for cursor in cursors:
+        write_cursor_config(
+            cursor, hotspots[cursor.name], build_dir / cursor.path.name
+        )
 
     out_dir = build_dir / "out"
     out_dir.mkdir()
-    for cursor_file in cursor_files:
-        output = out_dir / f"Cursor-{cursor_file.stem}"
+    for cursor in cursors:
+        output = out_dir / f"Cursor-{cursor.name}"
         result = subprocess.run(
-            ["xcursorgen", cursor_file.name, str(output.relative_to(build_dir))],
+            ["xcursorgen", cursor.path.name, str(output.relative_to(build_dir))],
             cwd=build_dir,
             capture_output=True,
             text=True,
@@ -961,14 +1064,34 @@ def cmd_preview(args: argparse.Namespace) -> None:
     PALETTES_DIR.mkdir(exist_ok=True)
     validate_map(map_rows, counts, strict=False)
 
-    _cursor_files, sequences = parse_cursors()
+    cursors = parse_cursors()
+    hotspots = resolve_hotspots(cursors, align=not args.no_align)
+    sequences = {cursor.name: list(cursor.frames) for cursor in cursors}
     preview_rows = build_preview_rows(map_rows, counts)
 
     html_path = PREVIEW_DIR / "index.html"
     sheet_path = PREVIEW_DIR / "contact_sheet.png"
 
-    generate_html(preview_rows, counts, sequences, html_path)
+    generate_html(preview_rows, counts, sequences, html_path, hotspots)
     generate_contact_sheet(preview_rows, sequences, sheet_path)
+
+    if args.no_align:
+        print("[info] Hotspots originais (sem alinhamento pelo focinho).")
+    else:
+        adjusted = [
+            cursor
+            for cursor in cursors
+            if hotspots[cursor.name] != cursor.hotspot
+        ]
+        if adjusted:
+            print("[ok] Hotspots alinhados pelo focinho:")
+            for cursor in adjusted:
+                old = cursor.hotspot
+                new = hotspots[cursor.name]
+                print(
+                    f"       {cursor.name}: ({old[0]},{old[1]}) -> "
+                    f"({new[0]},{new[1]})"
+                )
 
     print(f"[ok] Preview: {html_path}")
     print(f"[ok] Contact sheet: {sheet_path}")
@@ -981,7 +1104,10 @@ def cmd_build(args: argparse.Namespace) -> None:
     if not args.map:
         raise SystemExit("[erro] --build exige --map")
     build_variant(
-        args.variant, Path(args.map).expanduser(), strict=args.strict
+        args.variant,
+        Path(args.map).expanduser(),
+        strict=args.strict,
+        align=not args.no_align,
     )
 
 
@@ -999,7 +1125,9 @@ def cmd_build_all(args: argparse.Namespace) -> None:
             print(f"[aviso] Ignorando {map_path.name}: nome de variante vazio")
             continue
         print(f"\n=== Build {variant} ({map_path.name}) ===")
-        build_variant(variant, map_path, strict=args.strict)
+        build_variant(
+            variant, map_path, strict=args.strict, align=not args.no_align
+        )
 
 
 def cmd_install(args: argparse.Namespace) -> None:
@@ -1038,6 +1166,43 @@ def cmd_install(args: argparse.Namespace) -> None:
     )
 
 
+def package_tar(src: Path, out: Path, compress: bool = False) -> None:
+    mode = "w:gz" if compress else "w"
+    with tarfile.open(out, mode) as tar:
+        tar.add(src, arcname=src.name)
+
+
+def package_zip(src: Path, out: Path) -> None:
+    """Zip preserving symlinks and file modes (Unix attributes)."""
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(src, followlinks=False):
+            root_path = Path(root)
+            dirs.sort()
+            files.sort()
+
+            for dirname in dirs:
+                path = root_path / dirname
+                if not path.is_symlink():
+                    continue
+                arcname = str(Path(src.name) / path.relative_to(src))
+                add_zip_symlink(zf, path, arcname)
+
+            for filename in files:
+                path = root_path / filename
+                arcname = str(Path(src.name) / path.relative_to(src))
+                if path.is_symlink():
+                    add_zip_symlink(zf, path, arcname)
+                else:
+                    zf.write(path, arcname)
+
+
+def add_zip_symlink(zf: zipfile.ZipFile, path: Path, arcname: str) -> None:
+    info = zipfile.ZipInfo(arcname)
+    info.create_system = 3  # Unix
+    info.external_attr = (0o120777 << 16) | 0o777
+    zf.writestr(info, os.readlink(path))
+
+
 def cmd_package(args: argparse.Namespace) -> None:
     if not args.variant:
         raise SystemExit("[erro] --package exige --variant")
@@ -1050,10 +1215,18 @@ def cmd_package(args: argparse.Namespace) -> None:
             f"       Rode --build --variant {args.variant} primeiro."
         )
 
-    out = DIST_DIR / f"Horse-Cursor-{args.variant}.tar.gz"
-    with tarfile.open(out, "w:gz") as tar:
-        tar.add(src, arcname=src.name)
-    print(f"[ok] Pacote: {out}")
+    formats = args.package_format or ["tar.gz"]
+    for fmt in formats:
+        if fmt == "zip":
+            out = DIST_DIR / f"Horse-Cursor-{args.variant}.zip"
+            package_zip(src, out)
+        elif fmt == "tar":
+            out = DIST_DIR / f"Horse-Cursor-{args.variant}.tar"
+            package_tar(src, out, compress=False)
+        else:
+            out = DIST_DIR / f"Horse-Cursor-{args.variant}.tar.gz"
+            package_tar(src, out, compress=True)
+        print(f"[ok] Pacote: {out}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1113,9 +1286,20 @@ def main(argv: list[str] | None = None) -> int:
         help="aborta se alguma cor opaca ficar fora do mapa",
     )
     parser.add_argument(
+        "--package-format",
+        action="append",
+        choices=["tar.gz", "tar", "zip"],
+        help="formato do pacote (pode repetir; padrão: tar.gz)",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="sobrescreve o CSV no --extract",
+    )
+    parser.add_argument(
+        "--no-align",
+        action="store_true",
+        help="mantém os hotspots originais (não alinha pelo focinho)",
     )
     args = parser.parse_args(argv)
 
@@ -1281,6 +1465,18 @@ button.secondary {
 }
 button:hover { filter: brightness(1.08); }
 button:active { transform: translateY(1px); }
+.file-button {
+  display: inline-flex;
+  align-items: center;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.file-button:hover { filter: brightness(1.08); }
 #status { color: var(--muted); font-size: 0.9rem; }
 #export-status { font-size: 0.9rem; color: var(--muted); }
 #export-status[data-kind="ok"] { color: var(--ok); }
@@ -1314,8 +1510,24 @@ button:active { transform: translateY(1px); }
 }
 .cursors-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
   gap: 12px;
+}
+.align-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+.hotspot {
+  margin: 10px 0 0;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 .cursor-card {
   background: var(--panel);
@@ -1338,8 +1550,8 @@ button:active { transform: translateY(1px); }
   letter-spacing: 0.05em;
 }
 .anim canvas {
-  width: 128px;
-  height: 128px;
+  width: 144px;
+  height: 144px;
   image-rendering: pixelated;
   image-rendering: crisp-edges;
   border: 1px solid var(--border);
@@ -1360,7 +1572,7 @@ footer {
 }
 @media (max-width: 600px) {
   body { padding: 12px; }
-  .anim canvas { width: 96px; height: 96px; }
+  .anim canvas { width: 108px; height: 108px; }
   .anim-pair { gap: 8px; }
 }
 </style>
@@ -1380,6 +1592,8 @@ footer {
     <button type="button" id="reset" class="secondary">Reset</button>
     <button type="button" id="export">Exportar CSV</button>
     <button type="button" id="copy-csv" class="secondary">Copiar CSV</button>
+    <label class="file-button" for="csv-file">Carregar CSV</label>
+    <input type="file" id="csv-file" accept=".csv,text/csv" hidden>
     <span id="export-status" role="status" aria-live="polite"></span>
     <span id="status">carregando…</span>
   </div>
@@ -1393,6 +1607,10 @@ footer {
 
 <section>
   <h2>Cursores</h2>
+  <label class="align-toggle">
+    <input type="checkbox" id="align-toggle" checked>
+    Alinhar pelo ponteiro (hotspot)
+  </label>
   <div class="cursors-grid" id="cursors-grid"></div>
 </section>
 
@@ -1403,10 +1621,16 @@ footer {
 <script>
 const PALETTE = __PALETTE_JSON__;
 const CURSORS = __CURSORS_JSON__;
+const HOTSPOTS = __HOTSPOTS_JSON__;
 const FRAMES = __FRAMES_JSON__;
 const IGNORED = __IGNORED_JSON__;
 const REGIONS = __REGIONS_JSON__;
 const META = __META_JSON__;
+
+const CANVAS_SIZE = 36;
+const ANCHOR_X = 2;
+const ANCHOR_Y = 12;
+let alignByHotspot = true;
 
 const REGION_META = {
   eye: {
@@ -1514,12 +1738,14 @@ function buildCursorCards() {
     const card = document.createElement('div');
     card.className = 'cursor-card';
     card.dataset.cursor = name;
+    const hot = HOTSPOTS[name] || [0, 0];
     card.innerHTML = `
       <h3>${esc(name)}</h3>
       <div class="anim-pair">
-        <div class="anim"><span>Original</span><canvas class="before" width="32" height="32"></canvas></div>
-        <div class="anim"><span>Novo</span><canvas class="after" width="32" height="32"></canvas></div>
-      </div>`;
+        <div class="anim"><span>Original</span><canvas class="before" width="${CANVAS_SIZE}" height="${CANVAS_SIZE}"></canvas></div>
+        <div class="anim"><span>Novo</span><canvas class="after" width="${CANVAS_SIZE}" height="${CANVAS_SIZE}"></canvas></div>
+      </div>
+      <p class="hotspot">ponteiro em (${hot[0]}, ${hot[1]})</p>`;
     grid.appendChild(card);
   }
 }
@@ -1611,6 +1837,24 @@ function scheduleRebuild() {
   rebuildTimer = setTimeout(buildRecolored, 40);
 }
 
+function frameOffset(name) {
+  const [hx, hy] = HOTSPOTS[name] || [0, 0];
+  return alignByHotspot ? [ANCHOR_X - hx, ANCHOR_Y - hy] : [0, 0];
+}
+
+function drawCursorFrame(ctx, name, image) {
+  const [dx, dy] = frameOffset(name);
+  const [hx, hy] = HOTSPOTS[name] || [0, 0];
+  const px = Math.floor(dx + hx) + 0.5;
+  const py = Math.floor(dy + hy) + 0.5;
+
+  ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(dx + 0.5, dy + 0.5, 32, 32);
+  if (image) ctx.drawImage(image, dx, dy);
+}
+
 function startAnimations() {
   for (const card of document.querySelectorAll('.cursor-card')) {
     const name = card.dataset.cursor;
@@ -1625,11 +1869,9 @@ function startAnimations() {
 
     const step = () => {
       const [file, delay] = seq[index % seq.length];
-      bctx.clearRect(0, 0, 32, 32);
-      bctx.drawImage(images[file], 0, 0);
-      actx.clearRect(0, 0, 32, 32);
-      const frame = recolored.get(file);
-      if (frame) actx.drawImage(frame, 0, 0);
+      card.dataset.frame = file;
+      drawCursorFrame(bctx, name, images[file]);
+      drawCursorFrame(actx, name, recolored.get(file));
       index++;
       setTimeout(step, delay);
     };
@@ -1637,6 +1879,17 @@ function startAnimations() {
     step();
   }
 }
+
+document.getElementById('align-toggle').addEventListener('change', event => {
+  alignByHotspot = event.target.checked;
+  for (const card of document.querySelectorAll('.cursor-card')) {
+    const name = card.dataset.cursor;
+    const file = card.dataset.frame;
+    if (!file) continue;
+    drawCursorFrame(card.querySelector('canvas.before').getContext('2d'), name, images[file]);
+    drawCursorFrame(card.querySelector('canvas.after').getContext('2d'), name, recolored.get(file));
+  }
+});
 
 document.getElementById('reset').addEventListener('click', () => {
   for (const p of PALETTE) {
@@ -1753,8 +2006,125 @@ async function copyCsv() {
   }
 }
 
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      row.push(field);
+      field = '';
+    } else if (ch === '\n') {
+      row.push(field);
+      field = '';
+      rows.push(row);
+      row = [];
+    } else if (ch !== '\r') {
+      field += ch;
+    }
+  }
+
+  if (field !== '' || row.length) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows;
+}
+
+function normalizeHex(value) {
+  const raw = String(value || '').trim().replace(/^#/, '').toUpperCase();
+  return /^[0-9A-F]{6}$/.test(raw) ? '#' + raw : null;
+}
+
+function applyCsv(text) {
+  const rows = parseCsv(text.replace(/^\uFEFF/, '')).filter(
+    row => row.length && row.some(cell => cell.trim() !== '')
+  );
+  const first = String(rows[0]?.[0] ?? '').trim().toLowerCase();
+  const start = first === 'orig' ? 1 : 0;
+  let applied = 0;
+  const missing = [];
+  const invalid = [];
+
+  for (const row of rows.slice(start)) {
+    if (row.length < 2) continue;
+    const orig = normalizeHex(row[0]);
+    const neu = normalizeHex(row[1]);
+    if (!orig || !neu) {
+      invalid.push(row.join(','));
+      continue;
+    }
+    const target = (row[3] || 'color').trim().toLowerCase() || 'color';
+    const key = orig + '|' + target;
+    if (!state.has(key)) {
+      missing.push(target === 'color' ? orig : `${orig} [${target}]`);
+      continue;
+    }
+    state.set(key, neu);
+    const input = document.querySelector(`input[data-key="${CSS.escape(key)}"]`);
+    if (input) {
+      input.value = neu;
+      const label = input.closest('.color-block')?.querySelector('.hex-label');
+      if (label) label.textContent = neu;
+    }
+    applied++;
+  }
+
+  if (applied) buildRecolored();
+  return { applied, missing, invalid };
+}
+
+async function onCsvFile(event) {
+  const input = event.target;
+  const file = input.files && input.files[0];
+  if (!file) return;
+
+  try {
+    const summary = applyCsv(await file.text());
+    const parts = [`${summary.applied} linhas aplicadas`];
+    if (summary.missing.length) {
+      parts.push(`${summary.missing.length} fora da paleta`);
+    }
+    if (summary.invalid.length) {
+      parts.push(`${summary.invalid.length} inválidas`);
+    }
+    const kind = summary.applied ? 'ok' : 'error';
+    setExportStatus(`CSV carregado: ${parts.join(' · ')}.`, kind);
+    if (summary.missing.length) {
+      console.warn('Linhas fora da paleta:', summary.missing);
+    }
+
+    const variant = document.getElementById('variant-name');
+    const stem = file.name.replace(/\.csv$/i, '');
+    if (!variant.value.trim() || variant.value === 'MinhaCor') {
+      variant.value = stem;
+    }
+  } catch (error) {
+    console.error(error);
+    setExportStatus('Não foi possível ler o CSV: ' + error.message, 'error');
+  }
+  input.value = '';
+}
+
 document.getElementById('export').addEventListener('click', exportCsv);
 document.getElementById('copy-csv').addEventListener('click', copyCsv);
+document.getElementById('csv-file').addEventListener('change', onCsvFile);
 
 async function init() {
   buildPaletteUI();

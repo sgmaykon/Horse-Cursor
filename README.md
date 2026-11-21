@@ -31,6 +31,12 @@ python3 palette_swap.py --preview --map palette_map.csv
 
 Open `preview/index.html`, change the colors with the color pickers, watch the animations update live, and click **Exportar CSV**. Save the file as `palettes/<Name>.csv` (e.g. `palettes/Red.csv`). A static overview is also written to `preview/contact_sheet.png`.
 
+Other buttons in the preview:
+
+- **Carregar CSV** — load any `palettes/*.csv` (or a 3-column CSV) to visualize it; matching rows are applied to the pickers and the animations, and the variant name is taken from the file name.
+- **Copiar CSV** — copy the current CSV to the clipboard (fallback when downloads are blocked).
+- **Ver conteúdo do CSV** — shows the live CSV text so it can be checked or copied by hand.
+
 The **Olho** and **Crina** sections are separate: their pickers change only the eye pixel and the mane pixels in every frame, even when the rest of the horse uses the same original color. The hex code of the selected color is shown above each picker.
 
 ### The CSV format
@@ -47,6 +53,27 @@ orig,new,role,target
 - `target=eye` applies only to the detected eye pixel. If a color row and an eye row share the same `orig`, the eye row wins for the eye pixel.
 - `target=mane` applies only to the pixels of `orig` in the top `MANE_TOP_RATIO` (35%) of the horse's opaque bounding box, which is the mane region. The remaining pixels of that color (hooves, leg/tail outlines) follow the normal mapping.
 - Old 3-column CSVs (`orig,new,role`) still work.
+
+### Hotspot alignment
+
+Each line of a `.cursor` file carries the hotspot (the exact pixel placed under the pointer):
+
+```
+32 <xhot> <yhot> Horse-Normal1.png 80
+```
+
+The original hotspots came from different references, so the horse was drawn at a different offset for a few actions and the pointer jumped when the action changed. `--preview` and `--build` now anchor every cursor to the same reference: the **nose tip**, i.e. the leftmost opaque column of the first frame and the bottom pixel of that tip. That is the rule the original files already follow for 9 of the 13 cursors; only these four changed:
+
+| cursor | before | after |
+| --- | --- | --- |
+| Horse-Horizont | (5,17) | (5,9) |
+| Horse-Move | (17,6) | (3,16) |
+| Horse-Precisio | (4,10) | (5,9) |
+| Horse-Vertical | (0,10) | (0,13) |
+
+- The preview draws each action on a bigger canvas with a green crosshair marking the pointer, so alignment can be compared side by side. The **Alinhar pelo ponteiro (hotspot)** checkbox switches between the aligned view and the raw 32×32 canvas.
+- The `.cursor` sources in `Horse-Cursors-Files/` are never modified: corrected hotspots are written into `build/<Variant>/` and compiled into the generated theme only.
+- Pass `--no-align` to `--preview`, `--build` or `--build-all` to keep the original hotspots.
 
 ### 3. Build a variant
 
@@ -74,9 +101,17 @@ Then select **Horse-Cursor Red** in your desktop's cursor settings. Each variant
 
 ```bash
 python3 palette_swap.py --package --variant Red
+python3 palette_swap.py --package --variant Red --package-format tar --package-format zip
 ```
 
-This creates `dist/Horse-Cursor-Red.tar.gz` with `Horse-Cursor-Red/` at the top level.
+Formats: `tar.gz` (default), `tar` and `zip`. The archive contains the `Horse-Cursor-<Variant>/` folder with `index.theme` and `cursors/`: the compiled `Cursor-Horse-*` files plus all action symlinks (`default`, `pointer`, `move`, `v_double_arrow`, ...). Symlinks are stored as symlinks in both `.tar` and `.zip`.
+
+The original artwork can also be packaged with the corrected hotspots:
+
+```bash
+python3 palette_swap.py --build --variant original --map palette_map.csv
+python3 palette_swap.py --package --variant original --package-format tar --package-format zip
+```
 
 ### Notes
 
@@ -85,6 +120,6 @@ This creates `dist/Horse-Cursor-Red.tar.gz` with `Horse-Cursor-Red/` at the top 
 - The `pallet` file is only a reference legend; the source of truth for a variant is its CSV.
 - The eye is detected on the original PNGs as the single dark pixel surrounded by the light face colors, so it stays stable across all 103 frames and all variants.
 - The mane is detected on the original PNGs as the pixels of the mane color in the top 35% of each frame's opaque bounding box. Hooves and outlines with the same color stay in the normal mapping.
-- `palettes/Preto.csv` is a black variant sampled from `palettes/cavalo_preto_sprite.png`.
+- `palettes/Preto.csv` is a black variant sampled from `palettes/cavalo_preto_sprite.png`; `palettes/black.csv` is the tuned black palette used for the packaged theme.
 - Use `--strict` with `--build` to abort if any opaque color is missing from the map.
 - Variants are separate Xcursor themes; the desktop uses one active theme at a time, but multiple variants can stay installed.
