@@ -81,7 +81,7 @@ The original hotspots came from different references, so the horse was drawn at 
 python3 palette_swap.py --build --variant Red --map palettes/Red.csv
 ```
 
-The theme is written to `dist/Horse-Cursor-Red/`; the recolored PNGs stay in `build/Red/` for inspection. The variant's `index.theme` gets `Name=Horse-Cursor <Variant>`. To build every CSV in `palettes/`:
+The theme is written to `dist/Horse-Cursor-Red/`; the recolored PNGs stay in `build/Red/` for inspection. The variant's `index.theme` gets `Name=Horse-Cursor <Variant>` plus the version/provenance keys described in [Versioning](#versioning). To build every CSV in `palettes/`:
 
 ```bash
 python3 palette_swap.py --build-all
@@ -104,7 +104,7 @@ python3 palette_swap.py --package --variant Red
 python3 palette_swap.py --package --variant Red --package-format tar --package-format zip
 ```
 
-Formats: `tar.gz` (default), `tar` and `zip`. The archive contains the `Horse-Cursor-<Variant>/` folder with `index.theme` and `cursors/`: the compiled `Cursor-Horse-*` files plus all action symlinks (`default`, `pointer`, `move`, `v_double_arrow`, ...). Symlinks are stored as symlinks in both `.tar` and `.zip`.
+Formats: `tar.gz` (default), `tar` and `zip`. Archives are written to `releases/`. The archive contains the `Horse-Cursor-<Variant>/` folder with `index.theme` and `cursors/`: the compiled `Cursor-Horse-*` files plus all action symlinks (`default`, `pointer`, `move`, `v_double_arrow`, ...). Symlinks are stored as symlinks in both `.tar` and `.zip`.
 
 The original artwork can also be packaged with the corrected hotspots:
 
@@ -113,13 +113,29 @@ python3 palette_swap.py --build --variant original --map palette_map.csv
 python3 palette_swap.py --package --variant original --package-format tar --package-format zip
 ```
 
+### Versioning
+
+Every generated theme records its release data in `index.theme`, so a package can be identified without external metadata:
+
+```ini
+Version=1.0
+X-Horse-Cursor-Variant=black
+X-Horse-Cursor-Palette=palettes/black.csv
+X-Horse-Cursor-Hotspot=nose
+```
+
+- `Version` comes from `THEME_VERSION` in `palette_swap.py`. It identifies the compiled theme release; bump it when the compiled output changes.
+- `Name` keeps the human-readable variant (`Horse-Cursor black`), so variants coexist instead of overwriting each other.
+- `X-Horse-Cursor-*` keys are informational (Xcursor ignores them) and record the palette CSV and the hotspot rule used by the build: `nose` for the aligned default, `original` when built with `--no-align`.
+- Git tags mark released versions (e.g. `v1.0.0`), and the archives are attached to the GitHub Release instead of being committed. `releases/` is gitignored except for its `.gitkeep`.
+
 ### Notes
 
 - The original `Horse-Cursor/` theme is never modified.
-- `build/`, `dist/` and `preview/` are generated and ignored by git.
+- `build/`, `dist/` and `preview/` are generated and ignored by git; `releases/` only keeps a `.gitkeep`, since the archives are published as GitHub Releases.
 - The `pallet` file is only a reference legend; the source of truth for a variant is its CSV.
 - The eye is detected on the original PNGs as the single dark pixel surrounded by the light face colors, so it stays stable across all 103 frames and all variants.
 - The mane is detected on the original PNGs as the pixels of the mane color in the top 35% of each frame's opaque bounding box. Hooves and outlines with the same color stay in the normal mapping.
-- `palettes/Preto.csv` is a black variant sampled from `palettes/cavalo_preto_sprite.png`; `palettes/black.csv` is the tuned black palette used for the packaged theme.
+- `palettes/black.csv` is the tuned black palette used for the packaged theme.
 - Use `--strict` with `--build` to abort if any opaque color is missing from the map.
 - Variants are separate Xcursor themes; the desktop uses one active theme at a time, but multiple variants can stay installed.

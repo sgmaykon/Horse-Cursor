@@ -43,8 +43,13 @@ THEME_DIR = ROOT / "Horse-Cursor"
 PALETTES_DIR = ROOT / "palettes"
 BUILD_DIR = ROOT / "build"
 DIST_DIR = ROOT / "dist"
+RELEASES_DIR = ROOT / "releases"
 PREVIEW_DIR = ROOT / "preview"
 DEFAULT_MAP = ROOT / "palette_map.csv"
+
+# Versão do tema compilado. Aparece em Version= no index.theme de cada
+# variante e é incrementada quando o pacote muda de forma relevante.
+THEME_VERSION = "1.0"
 
 HEX_RE = re.compile(r"^#?([0-9A-Fa-f]{6})$")
 VARIANT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -879,7 +884,33 @@ def validate_variant(variant: str) -> None:
         )
 
 
-def update_index_theme(path: Path, variant: str) -> None:
+def upsert_theme_key(text: str, key: str, value: str, after: str) -> str:
+    """Define key=value, substituindo a chave ou inserindo após `after`."""
+    line = f"{key}={value}"
+    pattern = re.compile(rf"(?m)^{re.escape(key)}=.*$")
+    if pattern.search(text):
+        return pattern.sub(lambda _match: line, text, count=1)
+
+    anchor = re.search(rf"(?m)^{re.escape(after)}=.*$", text)
+    if anchor:
+        return text[: anchor.end()] + "\n" + line + text[anchor.end() :]
+    return text.replace("[Icon Theme]", f"[Icon Theme]\n{line}", 1)
+
+
+def palette_label(map_path: Path) -> str:
+    try:
+        return str(map_path.resolve().relative_to(ROOT))
+    except ValueError:
+        return map_path.name
+
+
+def update_index_theme(
+    path: Path,
+    variant: str,
+    map_path: Path | None = None,
+    align: bool = True,
+    version: str = THEME_VERSION,
+) -> None:
     if not path.exists():
         raise SystemExit(f"[erro] index.theme não encontrado: {path}")
 
@@ -900,6 +931,29 @@ def update_index_theme(path: Path, variant: str) -> None:
             text,
             count=1,
         )
+
+    # Versionamento e proveniência do build: versão do tema, variante,
+    # CSV de paleta usado e regra de hotspot aplicada.
+    text = upsert_theme_key(text, "Version", version, after="Comment")
+    text = upsert_theme_key(
+        text, "X-Horse-Cursor-Variant", variant, after="Version"
+    )
+    if map_path is not None:
+        text = upsert_theme_key(
+            text,
+            "X-Horse-Cursor-Palette",
+            palette_label(map_path),
+            after="X-Horse-Cursor-Variant",
+        )
+    hotspot_after = (
+        "X-Horse-Cursor-Palette" if map_path is not None else "X-Horse-Cursor-Variant"
+    )
+    text = upsert_theme_key(
+        text,
+        "X-Horse-Cursor-Hotspot",
+        "nose" if align else "original",
+        after=hotspot_after,
+    )
 
     path.write_text(text, encoding="utf-8")
 
@@ -972,7 +1026,9 @@ def build_variant(
     for compiled in sorted(out_dir.iterdir()):
         shutil.copy2(compiled, dist_theme / "cursors" / compiled.name)
 
-    update_index_theme(dist_theme / "index.theme", variant)
+    update_index_theme(
+        dist_theme / "index.theme", variant, map_path=map_path, align=align
+    )
 
     total_changed = sum(changed.values()) + sum(region_changed.values())
     print(f"[ok] Variante: {variant}")
@@ -1216,15 +1272,16 @@ def cmd_package(args: argparse.Namespace) -> None:
         )
 
     formats = args.package_format or ["tar.gz"]
+    RELEASES_DIR.mkdir(parents=True, exist_ok=True)
     for fmt in formats:
         if fmt == "zip":
-            out = DIST_DIR / f"Horse-Cursor-{args.variant}.zip"
+            out = RELEASES_DIR / f"Horse-Cursor-{args.variant}.zip"
             package_zip(src, out)
         elif fmt == "tar":
-            out = DIST_DIR / f"Horse-Cursor-{args.variant}.tar"
+            out = RELEASES_DIR / f"Horse-Cursor-{args.variant}.tar"
             package_tar(src, out, compress=False)
         else:
-            out = DIST_DIR / f"Horse-Cursor-{args.variant}.tar.gz"
+            out = RELEASES_DIR / f"Horse-Cursor-{args.variant}.tar.gz"
             package_tar(src, out, compress=True)
         print(f"[ok] Pacote: {out}")
 
@@ -1262,7 +1319,7 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument(
         "--package",
         action="store_true",
-        help="gera dist/Horse-Cursor-<Variante>.tar.gz",
+        help="gera releases/Horse-Cursor-<Variante>.tar.gz",
     )
     parser.add_argument(
         "--map", type=Path, help="CSV de mapeamento (orig,new,role,target)"
