@@ -114,7 +114,7 @@ Then select **Horse-Cursor Red** in your desktop's cursor settings. Each variant
 python3 palette_swap.py --package --variant Red
 ```
 
-Releases are always published as `.tar.gz` (`releases/Horse-Cursor-<Variant>.tar.gz`). The archive contains the `Horse-Cursor-<Variant>/` folder with `index.theme` and `cursors/`: the compiled `Cursor-Horse-*` files plus all action symlinks (`default`, `pointer`, `move`, `v_double_arrow`, ...). Symlinks are stored as symlinks.
+Each release is published in both formats: `releases/Horse-Cursor-<Variant>.tar.gz` and `releases/Horse-Cursor-<Variant>.zip`. Both archives contain the `Horse-Cursor-<Variant>/` folder with `index.theme` and `cursors/`: the compiled `Cursor-Horse-*` files plus all action symlinks (`default`, `pointer`, `move`, `v_double_arrow`, ...). Symlinks are stored as symlinks in both formats.
 
 The original artwork can also be packaged with the corrected hotspots:
 

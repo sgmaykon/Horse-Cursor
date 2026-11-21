@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import zipfile
 from collections import Counter
 from html import escape as html_escape
 from dataclasses import dataclass
@@ -1313,6 +1314,37 @@ def package_tar_gz(src: Path, out: Path) -> None:
         tar.add(src, arcname=src.name)
 
 
+def package_zip(src: Path, out: Path) -> None:
+    """Zip preserving symlinks and file modes (Unix attributes)."""
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(src, followlinks=False):
+            root_path = Path(root)
+            dirs.sort()
+            files.sort()
+
+            for dirname in dirs:
+                path = root_path / dirname
+                if not path.is_symlink():
+                    continue
+                arcname = str(Path(src.name) / path.relative_to(src))
+                add_zip_symlink(zf, path, arcname)
+
+            for filename in files:
+                path = root_path / filename
+                arcname = str(Path(src.name) / path.relative_to(src))
+                if path.is_symlink():
+                    add_zip_symlink(zf, path, arcname)
+                else:
+                    zf.write(path, arcname)
+
+
+def add_zip_symlink(zf: zipfile.ZipFile, path: Path, arcname: str) -> None:
+    info = zipfile.ZipInfo(arcname)
+    info.create_system = 3  # Unix
+    info.external_attr = (0o120777 << 16) | 0o777
+    zf.writestr(info, os.readlink(path))
+
+
 def cmd_package(args: argparse.Namespace) -> None:
     if not args.variant:
         raise SystemExit("[erro] --package exige --variant")
@@ -1326,9 +1358,14 @@ def cmd_package(args: argparse.Namespace) -> None:
         )
 
     RELEASES_DIR.mkdir(parents=True, exist_ok=True)
-    out = RELEASES_DIR / f"Horse-Cursor-{args.variant}.tar.gz"
-    package_tar_gz(src, out)
-    print(f"[ok] Pacote: {out}")
+
+    tar_gz = RELEASES_DIR / f"Horse-Cursor-{args.variant}.tar.gz"
+    package_tar_gz(src, tar_gz)
+    print(f"[ok] Pacote: {tar_gz}")
+
+    zip_out = RELEASES_DIR / f"Horse-Cursor-{args.variant}.zip"
+    package_zip(src, zip_out)
+    print(f"[ok] Pacote: {zip_out}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1371,7 +1408,7 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument(
         "--package",
         action="store_true",
-        help="gera releases/Horse-Cursor-<Variante>.tar.gz",
+        help="gera releases/Horse-Cursor-<Variante>.tar.gz e .zip",
     )
     parser.add_argument(
         "--map", type=Path, help="CSV de mapeamento (orig,new,role,target)"
